@@ -1702,12 +1702,15 @@ impl PersonMap {
     fn resolve(&self, ks: &mut [u64]) {
         let mut hit = [0u8; 64];
         let mut nh = 0usize;
+        // branch-free: about 39% of keys pass the filter, at random, so a branch here mispredicts.
+        // Always record the index and advance by 0 or 1; a miss prefetches a harmless hot address.
+        let dummy = self.slots.as_ptr() as usize;
         for (i, &k) in ks.iter().enumerate() {
-            if self.maybe(k) {
-                self.prefetch(k);
-                hit[nh] = i as u8;
-                nh += 1;
-            }
+            let m = self.maybe(k) as usize;
+            let slot = unsafe { self.slots.as_ptr().add(self.slot(k)) } as usize;
+            prefetch_ptr((if m != 0 { slot } else { dummy }) as *const i8);
+            unsafe { *hit.get_unchecked_mut(nh) = i as u8 };
+            nh += m;
         }
         for &i in &hit[..nh] {
             let k = unsafe { ks.get_unchecked_mut(i as usize) };
