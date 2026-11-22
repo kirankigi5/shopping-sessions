@@ -1780,8 +1780,15 @@ fn dedup_insert(ev_parts: &[Vec<Vec<ERec>>], b: usize, table: &mut Vec<Slot>, de
     dead.clear();
     dead.resize(n, false);
     let mut g = 0u32;
+    const AHEAD: usize = 16;
     for t in ev_parts.iter() {
-        for r in t[b].iter() {
+        let v = &t[b];
+        for (j, r) in v.iter().enumerate() {
+            // the table is about L2-sized: prefetch the slot of a record 16 ahead to overlap misses
+            if j + AHEAD < v.len() {
+                let e = unsafe { v.get_unchecked(j + AHEAD) }.eid;
+                prefetch_ptr(unsafe { table.as_ptr().add((mix(e) as usize) & mask) } as *const i8);
+            }
             let mut h = (mix(r.eid) as usize) & mask;
             loop {
                 let s = unsafe { table.get_unchecked_mut(h) };
