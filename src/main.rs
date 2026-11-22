@@ -97,9 +97,6 @@ const fn build_dec() -> [u8; 38] {
 }
 static DEC: [u8; 38] = build_dec();
 const SLOW: u64 = 1 << 63;
-const SHARD_BITS: u32 = 8;
-const SHARDS: usize = 1 << SHARD_BITS;
-const IDX_BITS: u32 = 63 - SHARD_BITS;
 
 #[inline(always)]
 fn hash_bytes(s: &[u8]) -> u64 {
@@ -116,16 +113,6 @@ fn hash_bytes(s: &[u8]) -> u64 {
         h = (h ^ u64::from_le_bytes(b)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     }
     mix(h)
-}
-
-#[derive(Default)]
-struct Shard {
-    map: HashMap<Box<[u8]>, u32, BuildHasherDefault<FastHasher>>,
-    vec: Vec<Box<[u8]>>,
-}
-static SHARD_TABLE: OnceLock<Vec<Mutex<Shard>>> = OnceLock::new();
-fn shards() -> &'static [Mutex<Shard>] {
-    SHARD_TABLE.get_or_init(|| (0..SHARDS).map(|_| Mutex::new(Shard::default())).collect())
 }
 
 #[inline(always)]
@@ -146,16 +133,7 @@ fn fast_key(s: &[u8]) -> Option<u64> {
     None
 }
 
-/// Exact, order-preserving key (see key_cmp).
-#[inline(always)]
-fn key(s: &[u8]) -> u64 {
-    match fast_key(s) {
-        Some(v) => v,
-        None => slow_key(s),
-    }
-}
-
-/// Equality-only key: long strings get a 63-bit hash instead of being interned.
+/// Equality-only key: short IDs encode exactly, others become SLOW | 63-bit hash.
 #[inline(always)]
 fn eq_key(s: &[u8]) -> u64 {
     match fast_key(s) {
@@ -164,29 +142,41 @@ fn eq_key(s: &[u8]) -> u64 {
     }
 }
 
-#[inline(never)]
-fn slow_key(s: &[u8]) -> u64 {
-    let h = hash_bytes(s);
-    let sh = (h >> (64 - SHARD_BITS)) as usize;
-    let mut t = shards()[sh].lock().unwrap();
-    let idx = match t.map.get(s) {
-        Some(&i) => i,
-        None => {
-            let i = t.vec.len() as u32;
-            let b: Box<[u8]> = s.into();
-            t.vec.push(b.clone());
-            t.map.insert(b, i);
-            i
-        }
-    };
-    SLOW | ((sh as u64) << IDX_BITS) | idx as u64
+/// Per-thread map from a long key to its bytes (no locking).
+type LongMap = FastMap<u64, Box<[u8]>>;
+
+/// Key that also remembers the bytes of long IDs in `longs`, so they can be ordered and printed.
+#[inline(always)]
+fn key(s: &[u8], longs: &mut LongMap) -> u64 {
+    match fast_key(s) {
+        Some(v) => v,
+        None => long_key(s, longs),
+    }
 }
 
-fn key_bytes(k: u64) -> Vec<u8> {
+#[inline(never)]
+fn long_key(s: &[u8], longs: &mut LongMap) -> u64 {
+    let k = SLOW | (hash_bytes(s) >> 1);
+    longs.entry(k).or_insert_with(|| s.into());
+    k
+}
+
+/// Read-only view over every thread's long-ID map.
+struct Longs<'a>(Vec<&'a LongMap>);
+impl Longs<'_> {
+    fn get(&self, k: u64) -> &[u8] {
+        for m in &self.0 {
+            if let Some(v) = m.get(&k) {
+                return v;
+            }
+        }
+        panic!("long key without bytes");
+    }
+}
+
+fn key_bytes(k: u64, longs: &Longs) -> Vec<u8> {
     if k & SLOW != 0 {
-        let sh = ((k & !SLOW) >> IDX_BITS) as usize;
-        let idx = (k & ((1u64 << IDX_BITS) - 1)) as usize;
-        shards()[sh].lock().unwrap().vec[idx].to_vec()
+        longs.get(k).to_vec()
     } else {
         (0..KEY_LEN)
             .map(|i| ((k >> (6 * (KEY_LEN - 1 - i))) & 0x3F) as usize)
@@ -197,13 +187,13 @@ fn key_bytes(k: u64) -> Vec<u8> {
 }
 
 #[inline(always)]
-fn key_cmp(a: u64, b: u64) -> std::cmp::Ordering {
+fn key_cmp(a: u64, b: u64, longs: &Longs) -> std::cmp::Ordering {
     if (a | b) & SLOW == 0 {
         a.cmp(&b)
     } else if a == b {
         std::cmp::Ordering::Equal
     } else {
-        key_bytes(a).cmp(&key_bytes(b))
+        key_bytes(a, longs).cmp(&key_bytes(b, longs))
     }
 }
 
@@ -695,7 +685,7 @@ struct EvCtx<'a> {
 }
 
 #[inline(never)]
-fn parse_events(data: &[u8], c: &EvCtx, out: &mut [Vec<ERec>]) {
+fn parse_events(data: &[u8], c: &EvCtx, out: &mut [Vec<ERec>], longs: &mut LongMap) {
     let mask = out.len() - 1;
     scan_lines::<7>(data, |f| {
         if f[0].is_empty() {
@@ -716,19 +706,20 @@ fn parse_events(data: &[u8], c: &EvCtx, out: &mut [Vec<ERec>]) {
             let ty = f[4];
             if ty == b"purchase" {
                 let Some(p) = parse_price(f[6]) else { break 'v };
-                let cat = *c.products.get(&key(f[5])).unwrap_or(&c.unknown_cat);
+                let cat = *c.products.get(&eq_key(f[5])).unwrap_or(&c.unknown_cat);
                 rec.pc = p << 8 | cat;
             } else if ty != b"view" && ty != b"cart" {
                 break 'v;
             }
-            rec.user = key(f[1]);
+            rec.user = key(f[1], longs);
             rec.ts = (ts - c.ws) as u32;
         }
         out[part_of(eid, mask)].push(rec);
     });
 }
 
-fn build_person_map(maps: &[Option<Buf>], chunks: &[Chunk]) -> FastMap<u64, u64> {
+fn build_person_map(maps: &[Option<Buf>], chunks: &[Chunk]) -> (FastMap<u64, u64>, LongMap) {
+    let mut longs = LongMap::default();
     let mut ids: FastMap<u64, u32> = FastMap::default();
     let mut keys: Vec<u64> = Vec::new();
     let mut parent: Vec<u32> = Vec::new();
@@ -747,8 +738,8 @@ fn build_person_map(maps: &[Option<Buf>], chunks: &[Chunk]) -> FastMap<u64, u64>
             if f[0].is_empty() || f[1].is_empty() {
                 return;
             }
-            let a = key(f[0]);
-            let b = key(f[1]);
+            let a = key(f[0], &mut longs);
+            let b = key(f[1], &mut longs);
             if a == b {
                 return;
             }
@@ -773,12 +764,13 @@ fn build_person_map(maps: &[Option<Buf>], chunks: &[Chunk]) -> FastMap<u64, u64>
             }
         });
     }
+    let lv = Longs(vec![&longs]);
     let n = keys.len();
     let mut name: Vec<u64> = vec![u64::MAX; n];
     let mut has = vec![false; n];
     for i in 0..n {
         let r = find(&mut parent, i as u32) as usize;
-        if !has[r] || key_cmp(keys[i], name[r]) == std::cmp::Ordering::Less {
+        if !has[r] || key_cmp(keys[i], name[r], &lv) == std::cmp::Ordering::Less {
             name[r] = keys[i];
             has[r] = true;
         }
@@ -791,7 +783,8 @@ fn build_person_map(maps: &[Option<Buf>], chunks: &[Chunk]) -> FastMap<u64, u64>
             m.insert(keys[i], name[r]);
         }
     }
-    m
+    drop(lv);
+    (m, longs)
 }
 
 struct Cfg {
@@ -815,7 +808,7 @@ fn main() {
         .clamp(1, 64);
     let cfg = Cfg {
         threads,
-        read: env_usize("SS_READ", 1) == 1,
+        read: env_usize("SS_READ", 0) == 1,
         p: env_usize("SS_P", 1024).next_power_of_two(),
         q: env_usize("SS_Q", 1024).next_power_of_two(),
     };
@@ -868,14 +861,14 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
     let unknown_cat = cat_index[&b"unknown"[..]];
     let mut products: FastMap<u64, u32> = FastMap::default();
     for r in &prod_rows {
-        products.entry(key(&r[0])).or_insert(cat_index[&r[1]]);
+        products.entry(eq_key(&r[0])).or_insert(cat_index[&r[1]]);
     }
     let camp_rows = read_small_csv::<2>(&data_dir.join("campaigns.csv"));
     let mut campaigns: FastMap<u64, u32> = FastMap::default();
     let mut camp_ids: Vec<Vec<u8>> = Vec::new();
     let mut camp_channels: Vec<Vec<u8>> = Vec::new();
     for r in &camp_rows {
-        let k = key(&r[0]);
+        let k = eq_key(&r[0]);
         if campaigns.contains_key(&k) {
             continue;
         }
@@ -915,7 +908,7 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
                     if variant == 0 {
                         scan_lines::<7>(d, |f| sink += f[0].len() as u64);
                     } else {
-                        parse_events(d, &ctx, &mut out);
+                        parse_events(d, &ctx, &mut out, &mut LongMap::default());
                     }
                 }
                 let el = t.elapsed().as_secs_f64();
@@ -934,7 +927,7 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
     let est_clicks = ck_bytes / 45 + 1024;
 
     // ---- links (background) + events parse
-    let (person_map, ev_parts) = std::thread::scope(|sc| {
+    let ((person_map, link_longs), ev_states) = std::thread::scope(|sc| {
         let lk = sc.spawn(|| {
             let m = build_person_map(&lk_maps, &lk_chunks);
             log(&t0, "links built");
@@ -942,14 +935,20 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
         });
         let cap = est_events / threads / P * 5 / 4 + 16;
         let ctx = EvCtx { ws, we, ingest_base, products: &products, unknown_cat };
-        let ev_parts: Vec<Vec<Vec<ERec>>> = parallel(
+        let ev_states: Vec<(Vec<Vec<ERec>>, LongMap)> = parallel(
             threads,
             ev_chunks.len(),
-            || buckets::<ERec>(P, cap),
-            |out, i| parse_events(chunk_data(&ev_maps, &ev_chunks[i]), &ctx, out),
+            || (buckets::<ERec>(P, cap), LongMap::default()),
+            |st, i| parse_events(chunk_data(&ev_maps, &ev_chunks[i]), &ctx, &mut st.0, &mut st.1),
         );
-        (lk.join().unwrap(), ev_parts)
+        (lk.join().unwrap(), ev_states)
     });
+    let mut long_maps: Vec<LongMap> = vec![link_longs];
+    let mut ev_parts: Vec<Vec<Vec<ERec>>> = Vec::with_capacity(ev_states.len());
+    for (parts, lm) in ev_states {
+        ev_parts.push(parts);
+        long_maps.push(lm);
+    }
     log(&t0, &format!("events parsed ({} chunks); links: {} remapped ids", ev_chunks.len(), person_map.len()));
     let person_of = |u: u64| -> u64 { *person_map.get(&u).unwrap_or(&u) };
 
@@ -958,13 +957,14 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
         ev: Vec<Vec<SRec>>,
         ck: Vec<Vec<CRec>>,
         table: Vec<Slot>,
+        longs: LongMap,
     }
     let ev_cap = est_events / threads / Q * 5 / 4 + 16;
     let ck_cap = est_clicks / threads / Q * 5 / 4 + 16;
     let mids: Vec<Mid> = parallel(
         threads,
         P + ck_chunks.len(),
-        || Mid { ev: buckets(Q, ev_cap), ck: buckets(Q, ck_cap), table: Vec::new() },
+        || Mid { ev: buckets(Q, ev_cap), ck: buckets(Q, ck_cap), table: Vec::new(), longs: LongMap::default() },
         |st, task| {
             if task < P {
                 let b = task;
@@ -1016,14 +1016,21 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
                     if ts < cs || ts >= we {
                         return;
                     }
-                    let Some(&camp) = campaigns.get(&key(f[2])) else { return };
-                    let person = person_of(key(f[1]));
-                    st.ck[part_of(person, QM)].push(CRec { person, cid: key(f[0]), ts: (ts - cs) as u32, camp });
+                    let Some(&camp) = campaigns.get(&eq_key(f[2])) else { return };
+                    let person = person_of(key(f[1], &mut st.longs));
+                    let cid = key(f[0], &mut st.longs);
+                    st.ck[part_of(person, QM)].push(CRec { person, cid, ts: (ts - cs) as u32, camp });
                 });
             }
         },
     );
     drop(ev_parts);
+    let mut mids = mids;
+    for m in mids.iter_mut() {
+        long_maps.push(std::mem::take(&mut m.longs));
+    }
+    let longs = Longs(long_maps.iter().filter(|m| !m.is_empty()).collect());
+    let longs = &longs;
     log(&t0, "events deduped, clicks parsed");
 
     // ---- sessionize + attribute per person bucket
@@ -1056,7 +1063,7 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
             }
             evs.sort_unstable_by_key(|e| ((e.person as u128) << 32) | e.ts as u128);
             cks.sort_unstable_by(|a, b| {
-                (a.person, a.ts).cmp(&(b.person, b.ts)).then_with(|| key_cmp(a.cid, b.cid))
+                (a.person, a.ts).cmp(&(b.person, b.ts)).then_with(|| key_cmp(a.cid, b.cid, longs))
             });
             let mut ci = 0usize;
             let mut i = 0usize;
@@ -1102,7 +1109,7 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
         for (ti, s) in states.iter().enumerate() {
             let path = ud_dir.join(format!("part-{:05}.parquet", ti));
             let cat_names = &cat_names;
-            sc.spawn(move || write_user_daily(&path, &s.rows, cat_names));
+            sc.spawn(move || write_user_daily(&path, &s.rows, cat_names, longs));
         }
         let path = cd_dir.join("part-00000.parquet");
         let (camp, camp_ids, camp_channels) = (&camp, &camp_ids, &camp_channels);
@@ -1263,7 +1270,7 @@ fn props() -> Arc<WriterProperties> {
     )
 }
 
-fn write_user_daily(path: &Path, rows: &[URow], cats: &[Vec<u8>]) {
+fn write_user_daily(path: &Path, rows: &[URow], cats: &[Vec<u8>], longs: &Longs) {
     let schema = Arc::new(
         parse_message_type(
             "message user_daily {
@@ -1286,7 +1293,7 @@ fn write_user_daily(path: &Path, rows: &[URow], cats: &[Vec<u8>]) {
         while let Some(mut c) = rg.next_column().unwrap() {
             match col {
                 0 => {
-                    let v: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(key_bytes(r.person))).collect();
+                    let v: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(key_bytes(r.person, longs))).collect();
                     c.typed::<ByteArrayType>().write_batch(&v, None, None).unwrap();
                 }
                 1 => {
@@ -1399,18 +1406,17 @@ mod tests {
 
     #[test]
     fn keys_roundtrip_and_order() {
+        let mut lm = LongMap::default();
         let ids: Vec<&[u8]> = vec![b"a", b"a0", b"a_", b"ab", b"u8w84o3t0", b"zzzzzzzzzz", b"0", b"c_1", b"c_10", b"c_2"];
-        for a in &ids {
-            assert_eq!(key_bytes(key(a)), a.to_vec());
-            for b in &ids {
-                assert_eq!(key_cmp(key(a), key(b)), a.cmp(b), "{:?} {:?}", a, b);
-            }
-        }
-        let odd: Vec<&[u8]> = vec![b"U1", b"u1 ", b" u1", b"abcdefghijk", b"e3\r"];
-        for a in &odd {
-            assert_eq!(key_bytes(key(a)), a.to_vec());
-            for b in ids.iter().chain(odd.iter()) {
-                assert_eq!(key_cmp(key(a), key(b)), a.cmp(b));
+        let odd: Vec<&[u8]> = vec![b"U1", b"u1 ", b" u1", b"abcdefghijk", b"e3\r", b"u1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4"];
+        let keys: Vec<u64> = ids.iter().chain(odd.iter()).map(|a| key(a, &mut lm)).collect();
+        let lv = Longs(vec![&lm]);
+        let all: Vec<&[u8]> = ids.iter().chain(odd.iter()).cloned().collect();
+        for (i, a) in all.iter().enumerate() {
+            assert_eq!(key_bytes(keys[i], &lv), a.to_vec());
+            assert_eq!(eq_key(a), keys[i]);
+            for (j, b) in all.iter().enumerate() {
+                assert_eq!(key_cmp(keys[i], keys[j], &lv), a.cmp(b), "{:?} {:?}", a, b);
             }
         }
     }
