@@ -106,9 +106,13 @@ time cap.
 | 77e6594 | 1.23 s | sessions: local person IDs + counting sort |
 | 18dc333 | **1.19 s** | skip freeing memory and exit at once, allocation-free key compare, windowed key encoding |
 | 34cfe6c | 1.20 s | people-sized session table, borrowed click-ID compare, shared output bytes, largest buckets first |
-| 1354d69 | **1.139 s (best)** | custom Parquet writer, dedup loser flags + sequential emit, radix sort for whales, uninitialized grouping buffers |
+| 1354d69 | **1.139 s (best scored)** | custom Parquet writer, dedup loser flags + sequential emit, radix sort for whales, uninitialized grouping buffers |
+| 181ae4b | (unscored) | SIMD exact ID encoding (SSE4.1/NEON) + branch-free SWAR time-of-day parse; windowed keys for links. Bigger Xeon win expected (scalar code is the Xeon's weak point). |
+| 4938302 | (unscored, main HEAD) | + overlap user_daily writes with session tail; `SS_DENSE`/`SS_P`/`SS_Q` env knobs; `parallel_fin` helper. |
 
-`1354d69` is the current best and the final entry. `main` HEAD only adds this document (same binary).
+`1354d69` is the scored best / final entry. `181ae4b` and `4938302` are newer and **not yet scored** — submit one to
+get a number. The `diag` branch (commit `4972485`) is based on `4938302` plus a P/Q/dense sweep; submit it as a
+diagnostic (it exits 1 on purpose to return logs).
 
 ## 6. Current architecture (src/main.rs `pipeline()`)
 
@@ -134,6 +138,10 @@ real bytes when either key is long.
 
 ## 7. Scorer measurements (diag `07937b3`, 20M, 8 threads, ms)
 
+**These are pre-SIMD-keys / pre-SWAR-time numbers (commit `1354d69`).** `181ae4b`/`4938302` should cut parse
+(keys were ~90 instr each, now ~38 via one 16-byte vector load; time-of-day is now branch-free SWAR), but this is
+**unverified on the Xeon** — a scored submission or a diag run is needed to confirm.
+
 - Phase walls: setup 13 | event parse ~560-600 (links ~360-560 alongside) | dedup+clicks **370-575** |
   sessions 165-230 | write **80-180**. Total ~1.1-1.4 s inside the process.
 - Summed thread time: parse 4.3-5.0 s, dedup insert 0.4-0.6, **dedup emit 1.2-1.7** (scales worst),
@@ -146,24 +154,36 @@ real bytes when either key is long.
 
 ## 8. What to do next (priority order)
 
-1. Optionally submit diag `03019ab` (same code as `1354d69` plus instrumentation, exits 1 on purpose) to get
-   scorer phase timings of the current best before starting the next big change.
-2. **Cut intermediate memory traffic (the biggest lever).** Today each event is written as a 32 B ERec, read in
-   dedup, written as a 16 B SRec, then copied again during grouping. Ideas:
-   - Build the links first, in parallel: parse link lines on all threads, then run union-find (~0.2 s single
-     thread on the scorer). Then parsing can map user→person directly and scatter **by person**. Dedup then
-     happens inside each person bucket. **Caveat:** about 1 in 64 duplicated events have copies with different
-     users (so different persons). Those need a cross-bucket fix. Example: mark per-bucket eid winners, then
-     resolve eids seen in several buckets via a small global set of "multi-person eids". Detect them by
-     scattering only (eid, ingest, bucket) 16 B triples, or a bloom/bitmap. This removes one full shuffle.
-   - Shrink ERec: for invalid copies only eid+ingest is needed; ts fits in u32; a person index could be u32.
-3. **Parsing** (~50% of CPU). Timestamps and keys cost about as much as tokenizing. Possible wins: decode
-   F1/F2/F3 with SWAR (8-byte loads, check digits in parallel); avoid re-scanning field bytes; specialize
-   per-file; skip the `products` hash for non-purchases (already done); keep the date cache.
-4. **Links thread**: parallelize link parsing; its CPU time competes with event parsing.
-5. **Output**: 80-180 ms on the scorer. Overlap writing with the tail of sessions (each worker writes its rows as
-   soon as its buckets are done), or write fewer and larger buffers.
-6. Lower priority: the session table's initial size, and P/Q sizes (256 vs 1024 made no clear difference).
+1. **Submit a scored run of `main` (4938302)** to see if SIMD keys + SWAR time + write-overlap helped on the Xeon.
+   This is the single most valuable next data point — the parse change is the biggest Xeon-facing win but is
+   unverified there. If it did not help, submit the `diag` branch (4972485) to read the new phase breakdown.
+2. **Cut intermediate memory traffic (the biggest remaining lever).** Today each event is written as a 32 B ERec,
+   read in dedup, written as a 16 B SRec, then copied again during grouping. The cleanest version:
+   - Build links first, in parallel (parse link lines on all threads, then union-find ~0.2 s single thread).
+     Then parsing can map user→person directly and scatter **by person**. Dedup then happens inside each person
+     bucket. **Caveat:** about 1 in 64 duplicated events have copies with different users (so different persons),
+     and invalid copies have no person at all. Resolve the rare cross-bucket/invalid cases via a compact
+     (eid, ingest, bucket) 16 B triple scattered by eid, or a bloom/bitmap, marking losers per bucket. This
+     removes the full eid→person emit shuffle (the phase that "scales worst", 1.2-1.7 s summed). **This is a
+     sizable, correctness-risky refactor** (cross-person dups, invalid copies, links-on-critical-path) — do it
+     only with time to test against all 6 seeds + dev + 36 fixtures + amd64.
+   - Shrink ERec: `repr(packed)` gives 28 B but saves only ~5-10 ms (not bandwidth-bound); a person u32 index
+     needs a global dict that does not exist at parse time. Low value.
+3. **Parsing** (~50% of CPU) — the high-value parts are **done**: SIMD exact key encoding (SSE4.1/NEON) replaces
+   the ~90-instr scalar key loop; SWAR branch-free time-of-day parse for F1/F2. Remaining: F3 (epoch-ms digits,
+   ~32% of ts) could use a Lemire-style 8-digit SWAR, but it is only ~1-2% overall with non-trivial overflow
+   edge cases at the 18-digit boundary — judged not worth the risk. Tokenize (34 ns/line, now the largest single
+   component) is hard to cut without restructuring the tokenizer↔callback interface.
+4. **Links thread**: parallelize link parsing. **Likely not worth it** — links (~0.23 s single-thread) finishes
+   well before parse (~0.6 s wall) so it is not on the critical path; total CPU work is fixed regardless of
+   oversubscription.
+5. **Output**: 80-180 ms on the scorer. **Done** — user_daily writes now overlap the session tail via
+   `parallel_fin`; only campaign_daily remains post-sessions.
+6. **P/Q sizes and dedup density**: `SS_P`, `SS_Q`, `SS_DENSE` env knobs added; the `diag` branch (4972485) sweeps
+   P/Q ∈ {1024,4096} × dense to find the Xeon L2-fit optimum (M4's huge L2 can't show this). Tune from a diag run.
+7. Evaluated-and-rejected micro-opts: campaign-counter layout flip `[day][campaign]` (per-person access is
+   already ~5 KB, fits L1 regardless); caching the `PersonMap` slot across prefetch→lookup (mix is ~3 cycles,
+   saves ~3 ms wall); slot index for clicks. Not worth the churn.
 
 ## 9. Gotchas learned the hard way
 
