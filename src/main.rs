@@ -1658,10 +1658,11 @@ fn main() {
             let big_out = scratch.join("out20");
             let big = [
                 Cfg { threads, read: false, p: 1024, q: 1024, dense: false }, // baseline
-                Cfg { threads, read: false, p: 4096, q: 1024, dense: false }, // smaller dedup tables (L2 fit)
+                Cfg { threads, read: false, p: 256, q: 1024, dense: false },  // fewer parse scatter streams
+                Cfg { threads, read: false, p: 4096, q: 1024, dense: false }, // smaller dedup tables
+                Cfg { threads, read: false, p: 1024, q: 256, dense: false },  // fewer emit scatter streams
                 Cfg { threads, read: false, p: 1024, q: 4096, dense: false }, // smaller session tables
-                Cfg { threads, read: false, p: 4096, q: 4096, dense: false }, // both small
-                Cfg { threads, read: false, p: 4096, q: 4096, dense: true },  // both small + dense dedup
+                Cfg { threads, read: false, p: 1024, q: 1024, dense: false }, // baseline again (noise)
                 Cfg { threads: 1, read: false, p: 1024, q: 1024, dense: false }, // single-thread CPU work
             ];
             for c in &big {
