@@ -4,7 +4,7 @@ on:
     branches: [bench]
   workflow_dispatch:
 env:
-  BASE: aee86503640340a491e403f16e632a0890650d1e
+  BASE: c289682d436ce644a60017cda29d93ef0e633386
 jobs:
   bench:
     runs-on: ubuntu-latest
@@ -54,4 +54,9 @@ jobs:
         run: |
           rm -rf /tmp/o; mkdir /tmp/o
           perf record -F 999 -o /tmp/perf.data env NCPU=4 DATA_DIR=/dev/shm/d OUTPUT_DIR=/tmp/o /tmp/new 2>&1 | tail -1
-          perf report -i /tmp/perf.data --stdio --no-children --sort sym 2>/dev/null | grep -v '^#' | grep -v '^$' | head -30 | cut -c1-140
+          perf report -i /tmp/perf.data --stdio --no-children --sort sym 2>/dev/null | grep -v '^#' | grep -v '^$' | head -16 | cut -c1-140
+          for pat in 'parallel_fin.*closure#0' 'parse_events::.closure#0' 'parse_clicks::.closure#0' 'parse_events$'; do
+            sym=$(perf report -i /tmp/perf.data --stdio --no-children --sort sym 2>/dev/null | grep -v '^#' | grep -m1 -E "$pat" | sed -E 's/.*\[\.\] //')
+            echo "=== $pat"
+            perf annotate -i /tmp/perf.data --stdio -l "$sym" 2>/dev/null | grep -E '^ +[0-9]+\.[0-9]+ +[a-z_0-9]+\.rs:[0-9]+' | sort -rn | head -22
+          done
