@@ -59,12 +59,13 @@ fn part_of(k: u64, mask: usize) -> usize {
 }
 
 // ---------------------------------------------------------------- string keys
-// A string of 1..=12 bytes from [0-9_a-z] encodes exactly as a base-38 number
+// A string of 1..=10 bytes from [0-9_a-z] encodes exactly as ten 6-bit codes
 // (0 = padding), so numeric order equals byte-wise order. Anything else is
 // interned and gets the top bit set; such keys compare by their bytes.
+const KEY_LEN: usize = 10;
 
 const fn build_enc() -> [u8; 256] {
-    let mut t = [0u8; 256];
+    let mut t = [0x80u8; 256];
     let mut i = 0;
     while i < 10 {
         t[b'0' as usize + i] = 1 + i as u8;
@@ -109,20 +110,15 @@ fn interned() -> &'static Mutex<Interned> {
 #[inline(always)]
 fn key(s: &[u8]) -> u64 {
     let n = s.len();
-    if n >= 1 && n <= 12 {
+    if n >= 1 && n <= KEY_LEN {
         let mut v = 0u64;
-        let mut bad = false;
-        for i in 0..12 {
-            let c = if i < n {
-                let c = ENC[s[i] as usize];
-                bad |= c == 0;
-                c
-            } else {
-                0
-            };
-            v = v * 38 + c as u64;
+        let mut flags = 0u8;
+        for i in 0..KEY_LEN {
+            let c = if i < n { ENC[s[i] as usize] } else { 0 };
+            flags |= c;
+            v |= ((c & 0x3F) as u64) << (6 * (KEY_LEN - 1 - i));
         }
-        if !bad {
+        if flags & 0x80 == 0 {
             return v;
         }
     }
@@ -149,13 +145,11 @@ fn key_bytes(k: u64) -> Vec<u8> {
     if k & SLOW != 0 {
         interned().lock().unwrap().vec[(k & !SLOW) as usize].clone()
     } else {
-        let mut d = [0u8; 12];
-        let mut v = k;
-        for i in (0..12).rev() {
-            d[i] = (v % 38) as u8;
-            v /= 38;
-        }
-        d.iter().take_while(|&&c| c != 0).map(|&c| DEC[c as usize]).collect()
+        (0..KEY_LEN)
+            .map(|i| ((k >> (6 * (KEY_LEN - 1 - i))) & 0x3F) as usize)
+            .take_while(|&c| c != 0)
+            .map(|c| DEC[c])
+            .collect()
     }
 }
 
@@ -169,6 +163,65 @@ fn key_cmp(a: u64, b: u64) -> std::cmp::Ordering {
 }
 
 // ---------------------------------------------------------------- CSV dialect
+
+/// Bit i set iff byte p[i] is ',', '"' or '\n' (64 bytes from p).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn mask64(p: *const u8) -> u64 {
+    use std::arch::x86_64::*;
+    unsafe {
+        let c = _mm256_set1_epi8(b',' as i8);
+        let q = _mm256_set1_epi8(b'"' as i8);
+        let n = _mm256_set1_epi8(b'\n' as i8);
+        let a = _mm256_loadu_si256(p as *const __m256i);
+        let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
+        let ra = _mm256_or_si256(_mm256_or_si256(_mm256_cmpeq_epi8(a, c), _mm256_cmpeq_epi8(a, q)), _mm256_cmpeq_epi8(a, n));
+        let rb = _mm256_or_si256(_mm256_or_si256(_mm256_cmpeq_epi8(b, c), _mm256_cmpeq_epi8(b, q)), _mm256_cmpeq_epi8(b, n));
+        (_mm256_movemask_epi8(ra) as u32 as u64) | ((_mm256_movemask_epi8(rb) as u32 as u64) << 32)
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+#[inline(always)]
+unsafe fn mask64(p: *const u8) -> u64 {
+    use std::arch::x86_64::*;
+    unsafe {
+        let c = _mm_set1_epi8(b',' as i8);
+        let q = _mm_set1_epi8(b'"' as i8);
+        let n = _mm_set1_epi8(b'\n' as i8);
+        let mut m = 0u64;
+        for k in 0..4 {
+            let v = _mm_loadu_si128(p.add(16 * k) as *const __m128i);
+            let r = _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v, c), _mm_cmpeq_epi8(v, q)), _mm_cmpeq_epi8(v, n));
+            m |= (_mm_movemask_epi8(r) as u16 as u64) << (16 * k);
+        }
+        m
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn mask64(p: *const u8) -> u64 {
+    // exact SWAR zero-byte detection, 8 bytes at a time
+    #[inline(always)]
+    fn zeros(x: u64) -> u64 {
+        const L: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+        !(((x & L) + L) | x | L)
+    }
+    #[inline(always)]
+    fn pack(hi: u64) -> u64 {
+        // high bit of each byte -> 8-bit mask
+        ((hi >> 7).wrapping_mul(0x0102_0408_1020_4080)) >> 56
+    }
+    let mut m = 0u64;
+    for k in 0..8 {
+        let w = unsafe { (p.add(8 * k) as *const u64).read_unaligned() };
+        let w = u64::from_le(w);
+        let z = zeros(w ^ 0x2c2c_2c2c_2c2c_2c2c) | zeros(w ^ 0x2222_2222_2222_2222) | zeros(w ^ 0x0a0a_0a0a_0a0a_0a0a);
+        m |= pack(z) << (8 * k);
+    }
+    m
+}
 
 /// Tokenizes `data` into lines of exactly N unquoted fields; malformed lines
 /// (wrong field count, stray quotes, empty) are skipped. Only '\n' ends a line.
@@ -195,23 +248,37 @@ fn scan_lines<'a, const N: usize>(data: &'a [u8], mut on_line: impl FnMut(&[&'a 
             quotes = 0;
         }};
     }
-    for p in memchr::memchr3_iter(b',', b'"', b'\n', data) {
-        match data[p] {
-            b',' => {
-                finish_field!(p);
-                fstart = p + 1;
-            }
-            b'"' => quotes += 1,
-            _ => {
-                finish_field!(p);
-                if !bad && nf == N {
-                    on_line(&fields);
+    let len = data.len();
+    let mut base = 0usize;
+    let mut tail = [0u8; 64];
+    while base < len {
+        let mut m = if base + 64 <= len {
+            unsafe { mask64(data.as_ptr().add(base)) }
+        } else {
+            tail[..len - base].copy_from_slice(&data[base..]);
+            unsafe { mask64(tail.as_ptr()) }
+        };
+        while m != 0 {
+            let p = base + m.trailing_zeros() as usize;
+            m &= m - 1;
+            match unsafe { *data.get_unchecked(p) } {
+                b',' => {
+                    finish_field!(p);
+                    fstart = p + 1;
                 }
-                nf = 0;
-                bad = false;
-                fstart = p + 1;
+                b'"' => quotes += 1,
+                _ => {
+                    finish_field!(p);
+                    if !bad && nf == N {
+                        on_line(&fields);
+                    }
+                    nf = 0;
+                    bad = false;
+                    fstart = p + 1;
+                }
             }
         }
+        base += 64;
     }
     if fstart < data.len() {
         finish_field!(data.len());
@@ -372,7 +439,7 @@ fn map_files(paths: &[PathBuf]) -> Vec<Option<Mmap>> {
                 return None;
             }
             let m = unsafe { Mmap::map(&f).ok()? };
-            let _ = m.advise(memmap2::Advice::Sequential);
+            let _ = m.advise(memmap2::Advice::WillNeed);
             Some(m)
         })
         .collect()
@@ -500,6 +567,48 @@ fn manifest_ts(text: &str, key: &str) -> i64 {
     let rest = &rest[q1 + 1..];
     let q2 = rest.find('"').unwrap();
     parse_ts(rest[..q2].as_bytes()).expect("manifest ts")
+}
+
+struct EvCtx<'a> {
+    ws: i64,
+    we: i64,
+    ingest_base: i64,
+    products: &'a FastMap<u64, u32>,
+    unknown_cat: u32,
+}
+
+#[inline(never)]
+fn parse_events(data: &[u8], c: &EvCtx, out: &mut [Vec<ERec>]) {
+    let mask = out.len() - 1;
+    scan_lines::<7>(data, |f| {
+        if f[0].is_empty() {
+            return;
+        }
+        let Some(ingest) = parse_ts(f[3]) else { return };
+        let eid = key(f[0]);
+        let ing_rel = (ingest.div_euclid(1000) - c.ingest_base).clamp(0, u32::MAX as i64) as u32;
+        let mut rec = ERec { eid, user: 0, ingest: ing_rel, ts: INVALID, pc: 0 };
+        'v: {
+            if f[1].is_empty() || f[5].is_empty() {
+                break 'v;
+            }
+            let Some(ts) = parse_ts(f[2]) else { break 'v };
+            if ts < c.ws || ts >= c.we || ingest - ts > DAY_MS {
+                break 'v;
+            }
+            let ty = f[4];
+            if ty == b"purchase" {
+                let Some(p) = parse_price(f[6]) else { break 'v };
+                let cat = *c.products.get(&key(f[5])).unwrap_or(&c.unknown_cat);
+                rec.pc = p << 8 | cat;
+            } else if ty != b"view" && ty != b"cart" {
+                break 'v;
+            }
+            rec.user = key(f[1]);
+            rec.ts = (ts - c.ws) as u32;
+        }
+        out[part_of(eid, mask)].push(rec);
+    });
 }
 
 fn build_person_map(maps: &[Option<Mmap>], chunks: &[Chunk]) -> FastMap<u64, u64> {
@@ -630,6 +739,32 @@ fn main() {
     let ck_bytes: usize = ck_chunks.iter().map(|c| c.end - c.start).sum();
     log(&t0, &format!("setup: {} MB events, {} MB clicks", ev_bytes >> 20, ck_bytes >> 20));
 
+    if std::env::var_os("BENCH_PARSE").is_some() {
+        let n = ev_chunks.len().min(400);
+        let lines: usize = (0..n).map(|i| memchr::memchr_iter(b'\n', chunk_data(&ev_maps, &ev_chunks[i])).count()).sum();
+        let ctx = EvCtx { ws, we, ingest_base, products: &products, unknown_cat };
+        for round in 0..3 {
+            for variant in 0..2 {
+                let mut out: Vec<Vec<ERec>> = buckets(1024, lines / 1024 * 5 / 4 + 16);
+                let mut sink = 0u64;
+                let t = Instant::now();
+                for i in 0..n {
+                    let d = chunk_data(&ev_maps, &ev_chunks[i]);
+                    if variant == 0 {
+                        scan_lines::<7>(d, |f| sink += f[0].len() as u64);
+                    } else {
+                        parse_events(d, &ctx, &mut out);
+                    }
+                }
+                let el = t.elapsed().as_secs_f64();
+                std::hint::black_box(sink);
+                let kept: usize = out.iter().map(|v| v.len()).sum();
+                eprintln!("round {} variant {} : {:.1} ns/line ({} recs)", round, variant, el * 1e9 / lines as f64, kept);
+            }
+        }
+        return;
+    }
+
     const P: usize = 1024;
     const PM: usize = P - 1;
     const Q: usize = 1024;
@@ -641,41 +776,12 @@ fn main() {
     let (person_map, ev_parts) = std::thread::scope(|sc| {
         let lk = sc.spawn(|| build_person_map(&lk_maps, &lk_chunks));
         let cap = est_events / threads / P * 5 / 4 + 16;
+        let ctx = EvCtx { ws, we, ingest_base, products: &products, unknown_cat };
         let ev_parts: Vec<Vec<Vec<ERec>>> = parallel(
             threads,
             ev_chunks.len(),
             || buckets::<ERec>(P, cap),
-            |out, i| {
-                scan_lines::<7>(chunk_data(&ev_maps, &ev_chunks[i]), |f| {
-                    if f[0].is_empty() {
-                        return;
-                    }
-                    let Some(ingest) = parse_ts(f[3]) else { return };
-                    let eid = key(f[0]);
-                    let ing_rel = (ingest.div_euclid(1000) - ingest_base).clamp(0, u32::MAX as i64) as u32;
-                    let mut rec = ERec { eid, user: 0, ingest: ing_rel, ts: INVALID, pc: 0 };
-                    'v: {
-                        if f[1].is_empty() || f[5].is_empty() {
-                            break 'v;
-                        }
-                        let Some(ts) = parse_ts(f[2]) else { break 'v };
-                        if ts < ws || ts >= we || ingest - ts > DAY_MS {
-                            break 'v;
-                        }
-                        let ty = f[4];
-                        if ty == b"purchase" {
-                            let Some(p) = parse_price(f[6]) else { break 'v };
-                            let cat = *products.get(&key(f[5])).unwrap_or(&unknown_cat);
-                            rec.pc = p << 8 | cat;
-                        } else if ty != b"view" && ty != b"cart" {
-                            break 'v;
-                        }
-                        rec.user = key(f[1]);
-                        rec.ts = (ts - ws) as u32;
-                    }
-                    out[part_of(eid, PM)].push(rec);
-                });
-            },
+            |out, i| parse_events(chunk_data(&ev_maps, &ev_chunks[i]), &ctx, out),
         );
         (lk.join().unwrap(), ev_parts)
     });
@@ -1103,4 +1209,44 @@ fn write_campaign_daily(path: &Path, camp: &[[i64; 4]], ndays: usize, day0: i64,
     }
     rg.close().unwrap();
     w.close().unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mask64_matches_naive() {
+        let mut x: u64 = 0x1234_5678;
+        let alphabet = b",\"\na\rz0 \x00\xff\x2c\x8a\xa2";
+        for _ in 0..20000 {
+            let mut buf = [0u8; 64];
+            for b in buf.iter_mut() {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                *b = if x & 3 == 0 { (x >> 8) as u8 } else { alphabet[(x >> 16) as usize % alphabet.len()] };
+            }
+            let want: u64 = (0..64).filter(|&i| matches!(buf[i], b',' | b'"' | b'\n')).map(|i| 1u64 << i).sum();
+            assert_eq!(unsafe { mask64(buf.as_ptr()) }, want);
+        }
+    }
+
+    #[test]
+    fn keys_roundtrip_and_order() {
+        let ids: Vec<&[u8]> = vec![b"a", b"a0", b"a_", b"ab", b"u8w84o3t0", b"zzzzzzzzzz", b"0", b"c_1", b"c_10", b"c_2"];
+        for a in &ids {
+            assert_eq!(key_bytes(key(a)), a.to_vec());
+            for b in &ids {
+                assert_eq!(key_cmp(key(a), key(b)), a.cmp(b), "{:?} {:?}", a, b);
+            }
+        }
+        let odd: Vec<&[u8]> = vec![b"U1", b"u1 ", b" u1", b"abcdefghijk", b"e3\r"];
+        for a in &odd {
+            assert_eq!(key_bytes(key(a)), a.to_vec());
+            for b in ids.iter().chain(odd.iter()) {
+                assert_eq!(key_cmp(key(a), key(b)), a.cmp(b));
+            }
+        }
+    }
 }

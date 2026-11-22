@@ -9,5 +9,5 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then export RUSTFLAGS="-C target-cpu=x86-64-
 
 FROM debian:bookworm-slim
 COPY --from=build /solution /app/solution
-ENV DATA_DIR=/data OUTPUT_DIR=/output SCRATCH_DIR=/scratch
+ENV DATA_DIR=/data OUTPUT_DIR=/output SCRATCH_DIR=/scratch MIMALLOC_ALLOW_LARGE_OS_PAGES=1
 CMD ["/app/solution"]
