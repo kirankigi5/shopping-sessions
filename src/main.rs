@@ -500,6 +500,90 @@ fn scan_lines<'a, const N: usize>(data: &'a [u8], on_line: impl FnMut(&[&'a [u8]
     scan_lines_ref::<N>(data, on_line)
 }
 
+/// Event lines: two 64-byte windows for an unquoted line that fits, otherwise the reference scanner.
+fn scan_events<'a>(data: &'a [u8], mut on_line: impl FnMut(&[&'a [u8]; 7])) {
+    let abs_end = data.as_ptr() as usize + data.len();
+    let mut i = 0usize;
+    while i < data.len() {
+        let rel = memchr::memchr(b'\n', &data[i..]).unwrap_or(data.len() - i);
+        let line = &data[i..i + rel];
+        let next = i + rel + usize::from(i + rel < data.len());
+        match split_event7(line, abs_end) {
+            EvSplit::Ok(fields) => on_line(&fields),
+            EvSplit::Drop => {}
+            EvSplit::Slow => scan_lines_ref::<7>(line, &mut on_line),
+        }
+        i = next;
+    }
+}
+
+enum EvSplit<'a> {
+    Ok([&'a [u8]; 7]),
+    Drop,
+    Slow,
+}
+
+fn split_event7<'a>(line: &'a [u8], abs_end: usize) -> EvSplit<'a> {
+    if line.is_empty() {
+        return EvSplit::Drop;
+    }
+    let mut commas = [0usize; 6];
+    let mut n = 0usize;
+    let mut quoted = false;
+    let mut off = 0usize;
+    while off < line.len() {
+        let avail = abs_end.saturating_sub(line.as_ptr() as usize + off);
+        let lim = (line.len() - off).min(64);
+        if avail >= 64 && lim > 0 {
+            let (sep, nl, q) = unsafe { masks(line.as_ptr().add(off)) };
+            let keep = if lim == 64 { u64::MAX } else { (1u64 << lim) - 1 };
+            if q & keep != 0 {
+                quoted = true;
+                break;
+            }
+            let mut s = sep & !nl & keep;
+            while s != 0 {
+                if n == 6 {
+                    return EvSplit::Drop;
+                }
+                commas[n] = off + s.trailing_zeros() as usize;
+                n += 1;
+                s &= s - 1;
+            }
+            off += 64;
+        } else {
+            for (k, &c) in line[off..].iter().enumerate() {
+                if c == b'"' {
+                    quoted = true;
+                    break;
+                }
+                if c == b',' {
+                    if n == 6 {
+                        return EvSplit::Drop;
+                    }
+                    commas[n] = off + k;
+                    n += 1;
+                }
+            }
+            break;
+        }
+    }
+    if quoted {
+        return EvSplit::Slow;
+    }
+    if n != 6 {
+        return EvSplit::Drop;
+    }
+    let mut fields: [&[u8]; 7] = [&[]; 7];
+    let mut start = 0usize;
+    for i in 0..6 {
+        fields[i] = &line[start..commas[i]];
+        start = commas[i] + 1;
+    }
+    fields[6] = &line[start..];
+    EvSplit::Ok(fields)
+}
+
 #[inline(always)]
 fn scan_lines_ref<'a, const N: usize>(data: &'a [u8], mut on_line: impl FnMut(&[&'a [u8]; N])) {
     let mut fields: [&'a [u8]; N] = [&[]; N];
@@ -1432,6 +1516,27 @@ impl<T: Copy, const K: usize> NtBuckets<T, K> {
     }
 }
 
+fn discard_vecs<T>(vs: &mut [Vec<T>]) {
+    for v in vs {
+        let bytes = v.capacity().saturating_mul(std::mem::size_of::<T>());
+        discard_bytes(v.as_mut_ptr() as *mut u8, bytes);
+    }
+}
+
+fn discard_bytes(ptr: *mut u8, len: usize) {
+    if ptr.is_null() || len < 4096 {
+        return;
+    }
+    let page = 4096usize;
+    let start = (ptr as usize + page - 1) & !(page - 1);
+    let end = (ptr as usize + len) & !(page - 1);
+    if end > start {
+        unsafe {
+            libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_DONTNEED);
+        }
+    }
+}
+
 #[inline(always)]
 fn nt_fence() {
     #[cfg(target_arch = "x86_64")]
@@ -1591,7 +1696,7 @@ fn parse_events(data: &[u8], c: &EvCtx, out: &mut NtBuckets<ERec, 2>, longs: &mu
     let mask = out.len() - 1;
     let mut dc = DateCache::new();
     let dend = data.as_ptr() as usize + data.len();
-    scan_lines::<7>(data, |f| {
+    scan_events(data, |f| {
         if f[0].is_empty() {
             return;
         }
@@ -1818,6 +1923,46 @@ fn dedup_emit(ev_parts: &[Vec<Vec<ERec>>], b: usize, dead: &[bool], pm: &PersonM
     nt_fence();
 }
 
+/// `c_` plus a canonical decimal (no leading zero, except `c_0`) indexes `arr`.
+/// Every other spelling goes through `map`.
+struct CampTab {
+    arr: Vec<u32>,
+    map: FastMap<u64, u32>,
+}
+fn c_num(s: &[u8]) -> Option<usize> {
+    if s.len() < 3 || s[0] != b'c' || s[1] != b'_' {
+        return None;
+    }
+    let d = &s[2..];
+    if d.is_empty() || (d.len() > 1 && d[0] == b'0') {
+        return None;
+    }
+    let mut v = 0usize;
+    for &c in d {
+        let x = (c as usize).wrapping_sub(b'0' as usize);
+        if x > 9 {
+            return None;
+        }
+        v = v.checked_mul(10)?.checked_add(x)?;
+        if v > 100_000 {
+            return None;
+        }
+    }
+    Some(v)
+}
+impl CampTab {
+    fn get(&self, s: &[u8], dend: usize) -> Option<u32> {
+        if let Some(n) = c_num(s) {
+            if let Some(&v) = self.arr.get(n) {
+                if v != u32::MAX {
+                    return Some(v);
+                }
+            }
+        }
+        self.map.get(&eq_key_at(s, dend)).copied()
+    }
+}
+
 #[inline(never)]
 fn parse_clicks(
     data: &[u8],
@@ -1825,7 +1970,7 @@ fn parse_clicks(
     base: *const u8,
     cs: i64,
     we: i64,
-    campaigns: &FastMap<u64, u32>,
+    campaigns: &CampTab,
     pm: &PersonMap,
     out: &mut [Vec<CRec>],
     longs: &mut LongMap,
@@ -1844,7 +1989,7 @@ fn parse_clicks(
         if ts < cs || ts >= we {
             return;
         }
-        let Some(&camp) = campaigns.get(&eq_key_at(f[2], dend)) else { return };
+        let Some(camp) = campaigns.get(f[2], dend) else { return };
         let u = eq_key_at(f[1], dend);
         pm.prefetch_bloom(u);
         let cid = match fast_key_at(f[0], dend) {
@@ -2117,15 +2262,22 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
         products.entry(eq_key(&r[0])).or_insert(cat_index[&r[1]]);
     }
     let camp_rows = read_small_csv::<2>(&data_dir.join("campaigns.csv"));
-    let mut campaigns: FastMap<u64, u32> = FastMap::default();
+    let mut campaigns = CampTab { arr: Vec::new(), map: FastMap::default() };
     let mut camp_ids: Vec<Vec<u8>> = Vec::new();
     let mut camp_channels: Vec<Vec<u8>> = Vec::new();
     for r in &camp_rows {
         let k = eq_key(&r[0]);
-        if campaigns.contains_key(&k) {
+        if campaigns.map.contains_key(&k) {
             continue;
         }
-        campaigns.insert(k, camp_ids.len() as u32);
+        let id = camp_ids.len() as u32;
+        campaigns.map.insert(k, id);
+        if let Some(n) = c_num(&r[0]) {
+            if campaigns.arr.len() <= n {
+                campaigns.arr.resize(n + 1, u32::MAX);
+            }
+            campaigns.arr[n] = id;
+        }
         camp_ids.push(r[0].clone());
         camp_channels.push(r[1].clone());
     }
@@ -2136,7 +2288,8 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
     let ev_paths = csv_files(&data_dir.join("events"));
     let ck_paths = csv_files(&data_dir.join("clicks"));
     let lk_paths = csv_files(&data_dir.join("links"));
-    let ev_maps = load_files(&ev_paths, cfg.read, threads);
+    // Events are read with pread. Clicks and links stay mapped unless SS_READ=1.
+    let ev_maps = load_files(&ev_paths, true, threads);
     let ck_maps = load_files(&ck_paths, cfg.read, threads);
     let lk_maps = load_files(&lk_paths, cfg.read, threads);
     let chunk_target = 2 << 20;
@@ -2267,6 +2420,13 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
         },
     );
 
+    // Pages of the event records are dead after dedup. Discard them on the workers
+    // that wrote them so exit does not unmap fresh anonymous memory on one thread.
+    std::thread::scope(|sc| {
+        for part in &mut ev_parts {
+            sc.spawn(|| discard_vecs(part));
+        }
+    });
     std::mem::forget(ev_parts);
     let mut mids = mids;
     for m in mids.iter_mut() {
@@ -2459,6 +2619,14 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
             timed!(A_WRITE, write_user_daily(&path, &st.rows, &cat_names, longs));
         },
     );
+    std::thread::scope(|sc| {
+        for m in &mut mids {
+            sc.spawn(|| {
+                discard_vecs(&mut m.ev);
+                discard_vecs(&mut m.ck);
+            });
+        }
+    });
     let mids = std::mem::ManuallyDrop::new(mids);
     let _ = &mids;
     log(&t0, "sessions built");
@@ -2822,28 +2990,27 @@ fn write_user_daily(path: &Path, rows: &[URow], cats: &[Vec<u8>], longs: &Longs)
 
 fn write_user_daily_fast(path: &Path, rows: &[URow], cats: &[Vec<u8>], longs: &Longs) {
     let n = rows.len();
-    let mut ubytes: Vec<u8> = Vec::with_capacity(n * 12);
-    let mut uends: Vec<u32> = Vec::with_capacity(n);
+    let mut ubytes: Vec<u8> = Vec::with_capacity(n.min(4096) * 12);
+    let mut uends: Vec<u32> = Vec::new();
+    let mut uidx: Vec<u32> = Vec::with_capacity(n);
     let mut last = u64::MAX;
-    let mut last_range = (0usize, 0usize);
+    let mut dict_i = 0u32;
     let mut sb = [0u8; KEY_LEN];
     for r in rows {
-        if r.person != last {
-            let start = ubytes.len();
+        if uends.is_empty() || r.person != last {
+            if !uends.is_empty() {
+                dict_i += 1;
+            }
             if r.person & SLOW != 0 {
                 ubytes.extend_from_slice(longs.get(r.person));
             } else {
                 let k = short_bytes(r.person, &mut sb);
                 ubytes.extend_from_slice(&sb[..k]);
             }
+            uends.push(ubytes.len() as u32);
             last = r.person;
-            last_range = (start, ubytes.len());
-        } else {
-            // repeat the person's bytes (PLAIN encoding stores each value)
-            let (a, b) = last_range;
-            ubytes.extend_from_within(a..b);
         }
-        uends.push(ubytes.len() as u32);
+        uidx.push(dict_i);
     }
     let day: Vec<i32> = rows.iter().map(|r| r.day).collect();
     let ses: Vec<i32> = rows.iter().map(|r| r.sessions as i32).collect();
@@ -2860,7 +3027,7 @@ fn write_user_daily_fast(path: &Path, rows: &[URow], cats: &[Vec<u8>], longs: &L
     pq::write(
         path,
         &[
-            pq::Col::Str { name: "user_id", bytes: &ubytes, ends: &uends },
+            pq::Col::DictStr { name: "user_id", dbytes: &ubytes, dends: &uends, idx: &uidx },
             pq::Col::Date { name: "day", vals: &day },
             pq::Col::I32 { name: "sessions", vals: &ses },
             pq::Col::I32 { name: "events", vals: &evn },
@@ -2875,7 +3042,10 @@ fn write_campaign_daily(path: &Path, camp: &[[i64; 4]], ndays: usize, day0: i64,
     if std::env::var_os("SS_PQ_CRATE").is_none() {
         let (mut ib, mut ie, mut cb, mut ce) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let mut day: Vec<i32> = Vec::new();
-        let mut vals: [Vec<i64>; 4] = Default::default();
+        let mut sessions: Vec<i32> = Vec::new();
+        let mut purchasing: Vec<i32> = Vec::new();
+        let mut revenue: Vec<i64> = Vec::new();
+        let mut assisted: Vec<i64> = Vec::new();
         let ncols = camp.len() / ndays.max(1);
         for c in 0..ncols {
             for d in 0..ndays {
@@ -2889,9 +3059,10 @@ fn write_campaign_daily(path: &Path, camp: &[[i64; 4]], ndays: usize, day0: i64,
                 cb.extend_from_slice(ch);
                 ce.push(cb.len() as u32);
                 day.push((day0 + d as i64) as i32);
-                for x in 0..4 {
-                    vals[x].push(cell[x]);
-                }
+                sessions.push(cell[0] as i32);
+                purchasing.push(cell[1] as i32);
+                revenue.push(cell[2]);
+                assisted.push(cell[3]);
             }
         }
         pq::write(
@@ -2900,10 +3071,10 @@ fn write_campaign_daily(path: &Path, camp: &[[i64; 4]], ndays: usize, day0: i64,
                 pq::Col::Str { name: "campaign_id", bytes: &ib, ends: &ie },
                 pq::Col::Str { name: "channel", bytes: &cb, ends: &ce },
                 pq::Col::Date { name: "day", vals: &day },
-                pq::Col::I64 { name: "sessions", vals: &vals[0] },
-                pq::Col::I64 { name: "purchasing_sessions", vals: &vals[1] },
-                pq::Col::I64 { name: "revenue_cents", vals: &vals[2] },
-                pq::Col::I64 { name: "assisted_sessions", vals: &vals[3] },
+                pq::Col::I32 { name: "sessions", vals: &sessions },
+                pq::Col::I32 { name: "purchasing_sessions", vals: &purchasing },
+                pq::Col::I64 { name: "revenue_cents", vals: &revenue },
+                pq::Col::I64 { name: "assisted_sessions", vals: &assisted },
             ],
         )
         .expect("write campaign_daily");
