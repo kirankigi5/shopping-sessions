@@ -16,7 +16,115 @@ mod diag;
 mod pq;
 
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: HugeAlloc = HugeAlloc;
+
+/// Big blocks (>= HUGE_MIN) come from one huge-page-advised bump region (never reused: dealloc
+/// is a no-op); everything else, and everything when the region is off or full, goes to mimalloc.
+/// The kernel's THP mode on the scorer is `madvise`, so memory only gets 2 MB pages if asked.
+struct HugeAlloc;
+const HUGE_MIN: usize = 32 << 10;
+const HUGE_RESERVE: usize = 48 << 30;
+static HUGE_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0); // 0 uninit, 1 off, 2 on, 3 initializing
+static HUGE_BASE: AtomicUsize = AtomicUsize::new(0);
+static HUGE_NEXT: AtomicUsize = AtomicUsize::new(0);
+
+#[inline(always)]
+fn huge_on() -> bool {
+    match HUGE_STATE.load(Ordering::Acquire) {
+        2 => true,
+        1 => false,
+        _ => huge_init(),
+    }
+}
+
+#[cold]
+fn huge_init() -> bool {
+    if HUGE_STATE.compare_exchange(0, 3, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+        let want = unsafe {
+            let v = libc::getenv(c"SS_HUGE".as_ptr());
+            v.is_null() || *v != b'0' as libc::c_char
+        };
+        let mut ok = false;
+        if want && cfg!(target_os = "linux") {
+            unsafe {
+                let p = libc::mmap(std::ptr::null_mut(), HUGE_RESERVE + (2 << 20), libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE, -1, 0);
+                if p != libc::MAP_FAILED {
+                    let base = (p as usize + (2 << 20) - 1) & !((2 << 20) - 1);
+                    #[cfg(target_os = "linux")]
+                    libc::madvise(base as *mut libc::c_void, HUGE_RESERVE, libc::MADV_HUGEPAGE);
+                    HUGE_BASE.store(base, Ordering::Relaxed);
+                    ok = true;
+                }
+            }
+        }
+        HUGE_STATE.store(if ok { 2 } else { 1 }, Ordering::Release);
+        return ok;
+    }
+    while HUGE_STATE.load(Ordering::Acquire) == 3 {
+        std::hint::spin_loop();
+    }
+    HUGE_STATE.load(Ordering::Acquire) == 2
+}
+
+impl HugeAlloc {
+    #[inline(always)]
+    fn owns(p: *mut u8) -> bool {
+        let b = HUGE_BASE.load(Ordering::Relaxed);
+        b != 0 && (p as usize).wrapping_sub(b) < HUGE_RESERVE
+    }
+    #[inline(always)]
+    unsafe fn bump(l: std::alloc::Layout) -> *mut u8 {
+        let a = l.align().max(64);
+        let sz = (l.size() + a - 1) & !(a - 1);
+        let off = HUGE_NEXT.fetch_add(sz, Ordering::Relaxed);
+        if off + sz > HUGE_RESERVE {
+            return std::ptr::null_mut();
+        }
+        (HUGE_BASE.load(Ordering::Relaxed) + off) as *mut u8
+    }
+}
+
+unsafe impl std::alloc::GlobalAlloc for HugeAlloc {
+    #[inline(always)]
+    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
+        if l.size() >= HUGE_MIN && l.align() <= 4096 && huge_on() {
+            let p = unsafe { Self::bump(l) };
+            if !p.is_null() {
+                return p;
+            }
+        }
+        unsafe { mimalloc::MiMalloc.alloc(l) }
+    }
+    #[inline(always)]
+    unsafe fn alloc_zeroed(&self, l: std::alloc::Layout) -> *mut u8 {
+        if l.size() >= HUGE_MIN && l.align() <= 4096 && huge_on() {
+            let p = unsafe { Self::bump(l) };
+            if !p.is_null() {
+                return p; // fresh anonymous memory is already zero
+            }
+        }
+        unsafe { mimalloc::MiMalloc.alloc_zeroed(l) }
+    }
+    #[inline(always)]
+    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+        if !Self::owns(p) {
+            unsafe { mimalloc::MiMalloc.dealloc(p, l) }
+        }
+    }
+    #[inline(always)]
+    unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        if Self::owns(p) || (new_size >= HUGE_MIN && huge_on()) {
+            let nl = unsafe { std::alloc::Layout::from_size_align_unchecked(new_size, l.align()) };
+            let q = unsafe { self.alloc(nl) };
+            if !q.is_null() {
+                unsafe { std::ptr::copy_nonoverlapping(p, q, l.size().min(new_size)) };
+                unsafe { self.dealloc(p, l) };
+            }
+            return q;
+        }
+        unsafe { mimalloc::MiMalloc.realloc(p, l, new_size) }
+    }
+}
 
 // ---------------------------------------------------------------- hashing
 
@@ -1761,16 +1869,16 @@ fn main() {
             .status();
         eprintln!("gen {:?} {:.1}s thp={}", st.map(|s| s.code()), t.elapsed().as_secs_f64(), thp);
         let me = std::env::current_exe().unwrap();
-        // (name, SS_SW, SS_P, SS_Q, large OS pages)
-        let variants: [(&str, &str, &str, &str, bool); 8] = [
-            ("best", "0", "1024", "1024", true),
-            ("f3", "2", "1024", "1024", true),
-            ("bloom", "4", "1024", "1024", true),
-            ("f3+bl", "6", "1024", "1024", true),
-            ("f3+bl-lp", "6", "1024", "1024", false),
-            ("best-lp", "0", "1024", "1024", false),
-            ("f3+bl p256", "6", "256", "1024", true),
-            ("f3+bl q256", "6", "1024", "256", true),
+        // (name, SS_SW, SS_P, SS_Q, SS_HUGE, SS_READ)
+        let variants: [(&str, &str, &str, &str, &str, &str); 8] = [
+            ("best", "0", "1024", "1024", "0", "0"),
+            ("q256", "6", "1024", "256", "0", "0"),
+            ("q256 H", "6", "1024", "256", "1", "0"),
+            ("q1024 H", "6", "1024", "1024", "1", "0"),
+            ("q128 H", "6", "1024", "128", "1", "0"),
+            ("q256 p512 H", "6", "512", "256", "1", "0"),
+            ("q256 p2k H", "6", "2048", "256", "1", "0"),
+            ("q256 H read", "6", "1024", "256", "1", "1"),
         ];
         let rounds = 3;
         let mut res: Vec<Vec<(f64, f64, f64)>> = vec![Vec::new(); variants.len()];
@@ -1780,12 +1888,7 @@ fn main() {
                 let _ = std::fs::remove_dir_all(&out);
                 std::fs::create_dir_all(&out).unwrap();
                 let mut cmd = std::process::Command::new(&me);
-                cmd.env("SS_CHILD", "1").env("DATA_DIR", &gen_dir).env("OUTPUT_DIR", &out).env("SS_SW", v.1).env("SS_P", v.2).env("SS_Q", v.3);
-                if v.4 {
-                    cmd.env("MIMALLOC_ALLOW_LARGE_OS_PAGES", "1");
-                } else {
-                    cmd.env_remove("MIMALLOC_ALLOW_LARGE_OS_PAGES");
-                }
+                cmd.env("SS_CHILD", "1").env("DATA_DIR", &gen_dir).env("OUTPUT_DIR", &out).env("SS_SW", v.1).env("SS_P", v.2).env("SS_Q", v.3).env("SS_HUGE", v.4).env("SS_READ", v.5);
                 cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
                 let mut r0: libc::rusage = unsafe { std::mem::zeroed() };
                 unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut r0) };
