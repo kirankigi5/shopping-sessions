@@ -997,6 +997,42 @@ struct URow {
 }
 const NO_CAT: u16 = u16::MAX;
 
+/// Thread-time accumulators (ns), filled only in diag builds.
+static ACC: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+const A_PARSE: usize = 0;
+const A_INS: usize = 1;
+const A_EMIT: usize = 2;
+const A_CLK: usize = 3;
+const A_SESS: usize = 4;
+const A_SESS_MAX: usize = 5;
+const A_LINKS: usize = 6;
+const A_WRITE: usize = 7;
+macro_rules! timed {
+    ($slot:expr, $e:expr) => {{
+        if cfg!(feature = "diag") {
+            let t = Instant::now();
+            let r = $e;
+            let ns = t.elapsed().as_nanos() as u64;
+            ACC[$slot].fetch_add(ns, Ordering::Relaxed);
+            if $slot == A_SESS {
+                ACC[A_SESS_MAX].fetch_max(ns, Ordering::Relaxed);
+            }
+            r
+        } else {
+            $e
+        }
+    }};
+}
+#[allow(dead_code)]
+fn acc_report() -> String {
+    let names = ["parse", "ins", "emit", "clk", "sess", "smax", "links", "write"];
+    let mut out = String::from(" T");
+    for (i, n) in names.iter().enumerate() {
+        out.push_str(&format!(" {}={:.0}", n, ACC[i].swap(0, Ordering::Relaxed) as f64 / 1e6));
+    }
+    out
+}
+
 static COMPACT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static LOGBUF: Mutex<String> = Mutex::new(String::new());
 
@@ -1009,7 +1045,17 @@ fn cpu_times() -> (f64, f64) {
 
 fn log(start: &Instant, msg: &str) {
     if COMPACT.load(Ordering::Relaxed) {
-        let word: String = msg.split(|c: char| c == ':' || c == '(' || c == ';').next().unwrap_or("").replace(' ', "_");
+        let w = msg.split(|c: char| c == ':' || c == '(' || c == ';').next().unwrap_or("");
+        let word = match w.trim() {
+            "setup" => "su",
+            "links built" => "lk",
+            "events parse threads done" => "ep",
+            "events parsed" => "ej",
+            "events deduped, clicks parsed" => "dd",
+            "sessions built" => "ss",
+            "done" => "wr",
+            x => x,
+        };
         let (u, sy) = cpu_times();
         LOGBUF.lock().unwrap().push_str(&format!(" {}={:.0}[u{:.0},s{:.0}]", word, start.elapsed().as_secs_f64() * 1000.0, u * 1000.0, sy * 1000.0));
     } else {
@@ -1364,12 +1410,8 @@ fn main() {
                 Cfg { threads, read: false, p: 1024, q: 1024 },
                 Cfg { threads, read: false, p: 1024, q: 1024 },
                 Cfg { threads, read: false, p: 1024, q: 1024 },
-                Cfg { threads, read: false, p: 256, q: 256 },
-                Cfg { threads, read: false, p: 4096, q: 4096 },
-                Cfg { threads: 4, read: false, p: 1024, q: 1024 },
-                Cfg { threads: 12, read: false, p: 1024, q: 1024 },
+                Cfg { threads, read: false, p: 256, q: 1024 },
                 Cfg { threads: 1, read: false, p: 1024, q: 1024 },
-                Cfg { threads, read: true, p: 1024, q: 1024 },
             ];
             for c in &big {
                 let _ = std::fs::remove_dir_all(&big_out);
@@ -1378,12 +1420,18 @@ fn main() {
                 pipeline(c, &gen_dir, &big_out);
                 let (u1, s1) = cpu_times();
                 let line = std::mem::take(&mut *LOGBUF.lock().unwrap());
-                eprintln!("BIG t={} read={} p={} cpu u={:.2} s={:.2}:{}", c.threads, c.read as u8, c.p, u1 - u0, s1 - s0, line);
+                eprintln!("B t{} p{} cpu{:.2}/{:.2} {}{}", c.threads, c.p, u1 - u0, s1 - s0, line, acc_report());
+            }
+            unsafe { std::env::set_var("BENCH_PARSE", "1") };
+            for th in [1usize, 8] {
+                unsafe { std::env::set_var("BENCH_THREADS", th.to_string()) };
+                pipeline(&big[0], &gen_dir, &big_out);
             }
         } else {
             eprintln!("no generator at {}", generator);
         }
-        let configs = [
+        let configs: [Cfg; 0] = [];
+        let _unused = [
             Cfg { threads, read: false, p: 1024, q: 1024 },
             Cfg { threads, read: true, p: 1024, q: 1024 },
             Cfg { threads, read: true, p: 256, q: 256 },
@@ -1399,7 +1447,7 @@ fn main() {
             let line = std::mem::take(&mut *LOGBUF.lock().unwrap());
             eprintln!("cfg t={} read={} p={}:{}", c.threads, c.read as u8, c.p, line);
         }
-        diag::bench_parse(&data_dir);
+        let _ = diag::bench_parse;
         eprintln!("DIAG build: exiting 1 on purpose to get logs");
         std::process::exit(1);
     }
@@ -1466,34 +1514,42 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
     log(&t0, &format!("setup: {} MB events, {} MB clicks", ev_bytes >> 20, ck_bytes >> 20));
 
     if std::env::var_os("BENCH_PARSE").is_some() {
-        let n = ev_chunks.len().min(env_usize("BENCH_N", 400));
+        let n = ev_chunks.len().min(env_usize("BENCH_N", 100000));
+        let bt = env_usize("BENCH_THREADS", 1).max(1);
         let lines: usize = (0..n).map(|i| memchr::memchr_iter(b'\n', chunk_data(&ev_maps, &ev_chunks[i])).count()).sum();
         let ctx = EvCtx { ws, we, ingest_base, products: &products, unknown_cat };
-        for round in 0..3 {
-            for variant in 0..5 {
-                let mut out: Vec<Vec<ERec>> = buckets(1024, lines / 1024 * 5 / 4 + 16);
-                let mut sink = 0u64;
-                let t = Instant::now();
-                for i in 0..n {
+        let mut line = format!("PB t{}", bt);
+        for variant in 0..6 {
+            let t = Instant::now();
+            parallel(
+                bt,
+                n,
+                || (buckets::<ERec>(1024, lines / bt / 1024 * 5 / 4 + 16), 0u64, LongMap::default(), Vec::<ERec>::with_capacity(lines / bt + 16)),
+                |st, i| {
                     let d = chunk_data(&ev_maps, &ev_chunks[i]);
+                    let sink = &mut st.1;
                     match variant {
-                        0 => scan_lines::<7>(d, |f| sink += f[0].len() as u64),
+                        0 => scan_lines::<7>(d, |f| *sink += f[0].len() as u64),
                         1 => scan_lines::<7>(d, |f| {
-                            sink = sink.wrapping_add(parse_ts(f[2]).unwrap_or(0) as u64 ^ parse_ts(f[3]).unwrap_or(0) as u64)
+                            *sink = sink.wrapping_add(parse_ts(f[2]).unwrap_or(0) as u64 ^ parse_ts(f[3]).unwrap_or(0) as u64)
                         }),
-                        2 => scan_lines::<7>(d, |f| sink = sink.wrapping_add(eq_key(f[0]) ^ eq_key(f[1]))),
+                        2 => scan_lines::<7>(d, |f| *sink = sink.wrapping_add(eq_key(f[0]) ^ eq_key(f[1]))),
                         3 => scan_lines::<7>(d, |f| {
-                            sink = sink.wrapping_add(eq_key(f[0]) ^ eq_key(f[1]) ^ parse_ts(f[2]).unwrap_or(0) as u64 ^ parse_ts(f[3]).unwrap_or(0) as u64)
+                            *sink = sink.wrapping_add(eq_key(f[0]) ^ eq_key(f[1]) ^ parse_ts(f[2]).unwrap_or(0) as u64 ^ parse_ts(f[3]).unwrap_or(0) as u64)
                         }),
-                        _ => parse_events(d, &ctx, &mut out, &mut LongMap::default()),
+                        4 => {
+                            let mut tmp = vec![std::mem::take(&mut st.3)];
+                            parse_events(d, &ctx, &mut tmp, &mut st.2);
+                            st.3 = std::mem::take(&mut tmp[0]);
+                        }
+                        _ => parse_events(d, &ctx, &mut st.0, &mut st.2),
                     }
-                }
-                let el = t.elapsed().as_secs_f64();
-                std::hint::black_box(sink);
-                let kept: usize = out.iter().map(|v| v.len()).sum();
-                eprintln!("round {} variant {} : {:.1} ns/line ({} recs)", round, variant, el * 1e9 / lines as f64, kept);
-            }
+                },
+            );
+            let el = t.elapsed().as_secs_f64();
+            line.push_str(&format!(" v{}={:.1}", variant, el * 1e9 * bt as f64 / lines as f64));
         }
+        eprintln!("{} ns/line/thread: tok,+ts,+keys,ts+keys,full-1bucket,full-1024", line);
         return;
     }
 
@@ -1506,7 +1562,7 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
     // ---- links (background) + events parse
     let ((person_map, link_longs), ev_states) = std::thread::scope(|sc| {
         let lk = sc.spawn(|| {
-            let m = build_person_map(&lk_maps, &lk_chunks);
+            let m = timed!(A_LINKS, build_person_map(&lk_maps, &lk_chunks));
             log(&t0, "links built");
             m
         });
@@ -1516,7 +1572,7 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
             threads,
             ev_chunks.len(),
             || (buckets::<ERec>(P, cap), LongMap::default()),
-            |st, i| parse_events(chunk_data(&ev_maps, &ev_chunks[i]), &ctx, &mut st.0, &mut st.1),
+            |st, i| timed!(A_PARSE, parse_events(chunk_data(&ev_maps, &ev_chunks[i]), &ctx, &mut st.0, &mut st.1)),
         );
         log(&t0, "events parse threads done");
         (lk.join().unwrap(), ev_states)
@@ -1545,11 +1601,11 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
         |st, task| {
             if task < P {
                 let b = task;
-                dedup_insert(&ev_parts, b, &mut st.table);
-                dedup_emit(&ev_parts, b, &st.table, &person_map, &mut st.ev);
+                timed!(A_INS, dedup_insert(&ev_parts, b, &mut st.table));
+                timed!(A_EMIT, dedup_emit(&ev_parts, b, &st.table, &person_map, &mut st.ev));
             } else {
                 let c = &ck_chunks[task - P];
-                parse_clicks(chunk_data(&ck_maps, c), c.file, ck_maps[c.file].as_ref().unwrap().as_ptr(), cs, we, &campaigns, &person_map, &mut st.ck, &mut st.longs);
+                timed!(A_CLK, parse_clicks(chunk_data(&ck_maps, c), c.file, ck_maps[c.file].as_ref().unwrap().as_ptr(), cs, we, &campaigns, &person_map, &mut st.ck, &mut st.longs));
             }
         },
     );
@@ -1568,6 +1624,8 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
     let ndays = ((we - 1).div_euclid(DAY_MS) - day0 + 1) as usize;
     let ncols = ncamp + 1;
     let ncat = cat_names.len();
+    let mut order: Vec<(usize, usize)> = (0..Q).map(|q| (mids.iter().map(|m| m.ev[q].len()).sum::<usize>(), q)).collect();
+    order.sort_unstable_by(|a, b| b.cmp(a));
     let states: Vec<St> = parallel(
         threads,
         Q,
@@ -1587,7 +1645,8 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
             lids: Vec::new(),
             loff: Vec::new(),
         },
-        |st, q| {
+        |st, qi| timed!(A_SESS, {
+            let q = order[qi].1;
             let mut evs = std::mem::take(&mut st.evs);
             let mut cks = std::mem::take(&mut st.cks);
             let n_ev: usize = mids.iter().map(|m| m.ev[q].len()).sum();
@@ -1724,7 +1783,7 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
             }
             st.evs = evs;
             st.cks = cks;
-        },
+        }),
     );
     let mids = std::mem::ManuallyDrop::new(mids);
     let _ = &mids;
@@ -1749,7 +1808,7 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
         for (ti, s) in states.iter().enumerate() {
             let path = ud_dir.join(format!("part-{:05}.parquet", ti));
             let cat_names = &cat_names;
-            sc.spawn(move || write_user_daily(&path, &s.rows, cat_names, longs));
+            sc.spawn(move || timed!(A_WRITE, write_user_daily(&path, &s.rows, cat_names, longs)));
         }
         let path = cd_dir.join("part-00000.parquet");
         let (camp, camp_ids, camp_channels) = (&camp, &camp_ids, &camp_channels);
