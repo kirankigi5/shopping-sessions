@@ -13,6 +13,7 @@ use memmap2::Mmap;
 
 #[cfg(feature = "diag")]
 mod diag;
+mod pq;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -1180,38 +1181,47 @@ impl PersonMap {
     }
 }
 
+/// Marks every copy except the one with the smallest ingest_ts (per event_id) as dead.
+/// Records of bucket `b` are numbered across worker vectors in order.
 #[inline(never)]
-fn dedup_insert(ev_parts: &[Vec<Vec<ERec>>], b: usize, table: &mut Vec<Slot>) {
+fn dedup_insert(ev_parts: &[Vec<Vec<ERec>>], b: usize, table: &mut Vec<Slot>, dead: &mut Vec<bool>) {
     let n: usize = ev_parts.iter().map(|t| t[b].len()).sum();
     let cap = (n * 2).next_power_of_two().max(64);
     let mask = cap - 1;
     table.clear();
     table.resize(cap, Slot { eid: 0, ingest: 0, idx: u32::MAX });
-    for (ti, t) in ev_parts.iter().enumerate() {
-        let tag = (ti as u32) << 26;
-        for (i, r) in t[b].iter().enumerate() {
+    dead.clear();
+    dead.resize(n, false);
+    let mut g = 0u32;
+    for t in ev_parts.iter() {
+        for r in t[b].iter() {
             let mut h = (mix(r.eid) as usize) & mask;
             loop {
-                let s = &mut table[h];
+                let s = unsafe { table.get_unchecked_mut(h) };
                 if s.idx == u32::MAX {
-                    *s = Slot { eid: r.eid, ingest: r.ingest, idx: tag | i as u32 };
+                    *s = Slot { eid: r.eid, ingest: r.ingest, idx: g };
                     break;
                 }
                 if s.eid == r.eid {
                     if r.ingest < s.ingest {
+                        dead[s.idx as usize] = true;
                         s.ingest = r.ingest;
-                        s.idx = tag | i as u32;
+                        s.idx = g;
+                    } else {
+                        dead[g as usize] = true;
                     }
                     break;
                 }
                 h = (h + 1) & mask;
             }
+            g += 1;
         }
     }
 }
 
+/// Emits surviving (winning, valid) events in record order, mapped to persons and scattered.
 #[inline(never)]
-fn dedup_emit(ev_parts: &[Vec<Vec<ERec>>], b: usize, table: &[Slot], pm: &PersonMap, out: &mut [Vec<SRec>]) {
+fn dedup_emit(ev_parts: &[Vec<Vec<ERec>>], b: usize, dead: &[bool], pm: &PersonMap, out: &mut [Vec<SRec>]) {
     let qm = out.len() - 1;
     const BATCH: usize = 16;
     let mut buf: [(u64, u32, u32); BATCH] = [(0, 0, 0); BATCH];
@@ -1222,20 +1232,21 @@ fn dedup_emit(ev_parts: &[Vec<Vec<ERec>>], b: usize, table: &[Slot], pm: &Person
             unsafe { out.get_unchecked_mut(part_of(person, qm)) }.push(SRec { person, ts, pc });
         }
     };
-    for s in table.iter() {
-        if s.idx == u32::MAX {
-            continue;
-        }
-        let r = unsafe { ev_parts.get_unchecked((s.idx >> 26) as usize).get_unchecked(b).get_unchecked((s.idx & ((1 << 26) - 1)) as usize) };
-        if r.ts == INVALID {
-            continue;
-        }
-        pm.prefetch(r.user);
-        buf[n] = (r.user, r.ts, r.pc);
-        n += 1;
-        if n == BATCH {
-            flush(&buf, out);
-            n = 0;
+    let mut g = 0usize;
+    for t in ev_parts.iter() {
+        for r in t[b].iter() {
+            let d = unsafe { *dead.get_unchecked(g) };
+            g += 1;
+            if d || r.ts == INVALID {
+                continue;
+            }
+            pm.prefetch(r.user);
+            buf[n] = (r.user, r.ts, r.pc);
+            n += 1;
+            if n == BATCH {
+                flush(&buf, out);
+                n = 0;
+            }
         }
     }
     flush(&buf[..n], out);
@@ -1605,6 +1616,7 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
         ev: Vec<Vec<SRec>>,
         ck: Vec<Vec<CRec>>,
         table: Vec<Slot>,
+        dead: Vec<bool>,
         longs: LongMap,
     }
     let ev_cap = est_events / threads / Q * 5 / 4 + 16;
@@ -1612,12 +1624,12 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
     let mids: Vec<Mid> = parallel(
         threads,
         P + ck_chunks.len(),
-        || Mid { ev: buckets(Q, ev_cap), ck: buckets(Q, ck_cap), table: Vec::new(), longs: LongMap::default() },
+        || Mid { ev: buckets(Q, ev_cap), ck: buckets(Q, ck_cap), table: Vec::new(), dead: Vec::new(), longs: LongMap::default() },
         |st, task| {
             if task < P {
                 let b = task;
-                timed!(A_INS, dedup_insert(&ev_parts, b, &mut st.table));
-                timed!(A_EMIT, dedup_emit(&ev_parts, b, &st.table, &person_map, &mut st.ev));
+                timed!(A_INS, dedup_insert(&ev_parts, b, &mut st.table, &mut st.dead));
+                timed!(A_EMIT, dedup_emit(&ev_parts, b, &st.dead, &person_map, &mut st.ev));
             } else {
                 let c = &ck_chunks[task - P];
                 timed!(A_CLK, parse_clicks(chunk_data(&ck_maps, c), c.file, ck_maps[c.file].as_ref().unwrap().as_ptr(), cs, we, &campaigns, &person_map, &mut st.ck, &mut st.longs));
@@ -1820,6 +1832,7 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
         }
     }
 
+    log(&t0, "campaigns merged");
     // ---- write outputs
     let ud_dir = out_dir.join("user_daily");
     let cd_dir = out_dir.join("campaign_daily");
@@ -2074,6 +2087,9 @@ fn props() -> Arc<WriterProperties> {
 }
 
 fn write_user_daily(path: &Path, rows: &[URow], cats: &[Vec<u8>], longs: &Longs) {
+    if std::env::var_os("SS_PQ_CRATE").is_none() {
+        return write_user_daily_fast(path, rows, cats, longs);
+    }
     let schema = Arc::new(
         parse_message_type(
             "message user_daily {
@@ -2156,7 +2172,95 @@ fn write_user_daily(path: &Path, rows: &[URow], cats: &[Vec<u8>], longs: &Longs)
     w.close().unwrap();
 }
 
+fn write_user_daily_fast(path: &Path, rows: &[URow], cats: &[Vec<u8>], longs: &Longs) {
+    let n = rows.len();
+    let mut ubytes: Vec<u8> = Vec::with_capacity(n * 12);
+    let mut uends: Vec<u32> = Vec::with_capacity(n);
+    let mut last = u64::MAX;
+    let mut last_range = (0usize, 0usize);
+    let mut sb = [0u8; KEY_LEN];
+    for r in rows {
+        if r.person != last {
+            let start = ubytes.len();
+            if r.person & SLOW != 0 {
+                ubytes.extend_from_slice(longs.get(r.person));
+            } else {
+                let k = short_bytes(r.person, &mut sb);
+                ubytes.extend_from_slice(&sb[..k]);
+            }
+            last = r.person;
+            last_range = (start, ubytes.len());
+        } else {
+            // repeat the person's bytes (PLAIN encoding stores each value)
+            let (a, b) = last_range;
+            ubytes.extend_from_within(a..b);
+        }
+        uends.push(ubytes.len() as u32);
+    }
+    let day: Vec<i32> = rows.iter().map(|r| r.day).collect();
+    let ses: Vec<i32> = rows.iter().map(|r| r.sessions as i32).collect();
+    let evn: Vec<i32> = rows.iter().map(|r| r.events as i32).collect();
+    let rev: Vec<i64> = rows.iter().map(|r| r.revenue).collect();
+    let present: Vec<bool> = rows.iter().map(|r| r.top != NO_CAT).collect();
+    let cidx: Vec<u32> = rows.iter().filter(|r| r.top != NO_CAT).map(|r| r.top as u32).collect();
+    let mut dbytes: Vec<u8> = Vec::new();
+    let mut dends: Vec<u32> = Vec::new();
+    for c in cats {
+        dbytes.extend_from_slice(c);
+        dends.push(dbytes.len() as u32);
+    }
+    pq::write(
+        path,
+        &[
+            pq::Col::Str { name: "user_id", bytes: &ubytes, ends: &uends },
+            pq::Col::Date { name: "day", vals: &day },
+            pq::Col::I32 { name: "sessions", vals: &ses },
+            pq::Col::I32 { name: "events", vals: &evn },
+            pq::Col::I64 { name: "revenue_cents", vals: &rev },
+            pq::Col::OptDictStr { name: "top_category", present: &present, dbytes: &dbytes, dends: &dends, idx: &cidx },
+        ],
+    )
+    .expect("write user_daily");
+}
+
 fn write_campaign_daily(path: &Path, camp: &[[i64; 4]], ndays: usize, day0: i64, ids: &[Vec<u8>], channels: &[Vec<u8>]) {
+    if std::env::var_os("SS_PQ_CRATE").is_none() {
+        let (mut ib, mut ie, mut cb, mut ce) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut day: Vec<i32> = Vec::new();
+        let mut vals: [Vec<i64>; 4] = Default::default();
+        let ncols = camp.len() / ndays.max(1);
+        for c in 0..ncols {
+            for d in 0..ndays {
+                let cell = camp[c * ndays + d];
+                if cell[0] == 0 && cell[3] == 0 {
+                    continue;
+                }
+                let (id, ch): (&[u8], &[u8]) = if c < ids.len() { (&ids[c], &channels[c]) } else { (b"organic", b"organic") };
+                ib.extend_from_slice(id);
+                ie.push(ib.len() as u32);
+                cb.extend_from_slice(ch);
+                ce.push(cb.len() as u32);
+                day.push((day0 + d as i64) as i32);
+                for x in 0..4 {
+                    vals[x].push(cell[x]);
+                }
+            }
+        }
+        pq::write(
+            path,
+            &[
+                pq::Col::Str { name: "campaign_id", bytes: &ib, ends: &ie },
+                pq::Col::Str { name: "channel", bytes: &cb, ends: &ce },
+                pq::Col::Date { name: "day", vals: &day },
+                pq::Col::I64 { name: "sessions", vals: &vals[0] },
+                pq::Col::I64 { name: "purchasing_sessions", vals: &vals[1] },
+                pq::Col::I64 { name: "revenue_cents", vals: &vals[2] },
+                pq::Col::I64 { name: "assisted_sessions", vals: &vals[3] },
+            ],
+        )
+        .expect("write campaign_daily");
+        return;
+    }
     let schema = Arc::new(
         parse_message_type(
             "message campaign_daily {
