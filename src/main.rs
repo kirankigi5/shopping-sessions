@@ -1719,7 +1719,7 @@ fn main() {
         threads,
         read: env_usize("SS_READ", 0) == 1,
         p: env_usize("SS_P", 1024).next_power_of_two(),
-        q: env_usize("SS_Q", 1024).next_power_of_two(),
+        q: env_usize("SS_Q", 256).next_power_of_two(),
         dense: env_usize("SS_DENSE", 0) == 1,
     };
     #[cfg(feature = "diag")]
