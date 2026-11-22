@@ -831,9 +831,23 @@ fn cpu_times() -> (f64, f64) {
 
 fn log(start: &Instant, msg: &str) {
     if COMPACT.load(Ordering::Relaxed) {
-        let word: String = msg.split(|c: char| c == ':' || c == '(' || c == ';').next().unwrap_or("").replace(' ', "_");
+        let w = msg.split(|c: char| c == ':' || c == '(' || c == ';').next().unwrap_or("");
+        let word = match w.trim() {
+            "setup" => "su",
+            "links built" => "lk",
+            "events parse threads done" => "ep",
+            "events parsed" => "ej",
+            "events deduped, clicks parsed" => "dd",
+            "sessions built" => "ss",
+            "done" => "wr",
+            x => x,
+        };
         let (u, sy) = cpu_times();
-        LOGBUF.lock().unwrap().push_str(&format!(" {}={:.0}[u{:.0},s{:.0}]", word, start.elapsed().as_secs_f64() * 1000.0, u * 1000.0, sy * 1000.0));
+        let mut lb = LOGBUF.lock().unwrap();
+        if lb.is_empty() {
+            *lb = format!("@{:.0}/{:.0}", u * 1000.0, sy * 1000.0);
+        }
+        lb.push_str(&format!(" {}={:.0}:{:.0}/{:.0}", word, start.elapsed().as_secs_f64() * 1000.0, u * 1000.0, sy * 1000.0));
     } else {
         eprintln!("[{:7.3}s] {}", start.elapsed().as_secs_f64(), msg);
     }
@@ -1198,12 +1212,13 @@ fn main() {
                 pipeline(c, &gen_dir, &big_out);
                 let (u1, s1) = cpu_times();
                 let line = std::mem::take(&mut *LOGBUF.lock().unwrap());
-                eprintln!("BIG t={} read={} p={} cpu u={:.2} s={:.2}:{}", c.threads, c.read as u8, c.p, u1 - u0, s1 - s0, line);
+                eprintln!("B t{} r{} p{} cpu{:.2}/{:.2} {}", c.threads, c.read as u8, c.p, u1 - u0, s1 - s0, line);
             }
         } else {
             eprintln!("no generator at {}", generator);
         }
-        let configs = [
+        let configs: [Cfg; 0] = [];
+        let _unused = [
             Cfg { threads, read: false, p: 1024, q: 1024 },
             Cfg { threads, read: true, p: 1024, q: 1024 },
             Cfg { threads, read: true, p: 256, q: 256 },
@@ -1219,7 +1234,7 @@ fn main() {
             let line = std::mem::take(&mut *LOGBUF.lock().unwrap());
             eprintln!("cfg t={} read={} p={}:{}", c.threads, c.read as u8, c.p, line);
         }
-        diag::bench_parse(&data_dir);
+        let _ = diag::bench_parse;
         eprintln!("DIAG build: exiting 1 on purpose to get logs");
         std::process::exit(1);
     }
