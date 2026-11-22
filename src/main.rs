@@ -1514,42 +1514,57 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
     log(&t0, &format!("setup: {} MB events, {} MB clicks", ev_bytes >> 20, ck_bytes >> 20));
 
     if std::env::var_os("BENCH_PARSE").is_some() {
+        // Component costs of event parsing using the production helpers (cached timestamps,
+        // windowed keys). Results are black_boxed; allocation is per variant; teardown is untimed.
         let n = ev_chunks.len().min(env_usize("BENCH_N", 100000));
         let bt = env_usize("BENCH_THREADS", 1).max(1);
         let lines: usize = (0..n).map(|i| memchr::memchr_iter(b'\n', chunk_data(&ev_maps, &ev_chunks[i])).count()).sum();
         let ctx = EvCtx { ws, we, ingest_base, products: &products, unknown_cat };
         let mut line = format!("PB t{}", bt);
-        for variant in 0..6 {
+        for variant in 0..6usize {
+            let per = lines / bt + 1024;
             let t = Instant::now();
-            parallel(
+            let states = parallel(
                 bt,
                 n,
-                || (buckets::<ERec>(1024, lines / bt / 1024 * 5 / 4 + 16), 0u64, LongMap::default(), Vec::<ERec>::with_capacity(lines / bt + 16)),
+                || {
+                    let bk: Vec<Vec<ERec>> = match variant {
+                        4 => vec![Vec::with_capacity(per)],
+                        5 => buckets::<ERec>(1024, per / 1024 * 5 / 4 + 16),
+                        _ => Vec::new(),
+                    };
+                    (bk, 0u64, LongMap::default())
+                },
                 |st, i| {
                     let d = chunk_data(&ev_maps, &ev_chunks[i]);
+                    let dend = d.as_ptr() as usize + d.len();
+                    let mut dc = DateCache::new();
                     let sink = &mut st.1;
                     match variant {
-                        0 => scan_lines::<7>(d, |f| *sink += f[0].len() as u64),
+                        0 => scan_lines::<7>(d, |f| *sink = sink.wrapping_add(f[0].len() as u64 ^ f[6].len() as u64)),
                         1 => scan_lines::<7>(d, |f| {
-                            *sink = sink.wrapping_add(parse_ts(f[2]).unwrap_or(0) as u64 ^ parse_ts(f[3]).unwrap_or(0) as u64)
+                            let a = parse_ts_c(f[2], &mut dc).unwrap_or(0) as u64;
+                            let b = parse_ts_c(f[3], &mut dc).unwrap_or(0) as u64;
+                            *sink = sink.wrapping_add(a ^ b.rotate_left(7));
                         }),
-                        2 => scan_lines::<7>(d, |f| *sink = sink.wrapping_add(eq_key(f[0]) ^ eq_key(f[1]))),
+                        2 => scan_lines::<7>(d, |f| *sink = sink.wrapping_add(eq_key_at(f[0], dend) ^ eq_key_at(f[1], dend).rotate_left(9))),
                         3 => scan_lines::<7>(d, |f| {
-                            *sink = sink.wrapping_add(eq_key(f[0]) ^ eq_key(f[1]) ^ parse_ts(f[2]).unwrap_or(0) as u64 ^ parse_ts(f[3]).unwrap_or(0) as u64)
+                            let a = parse_ts_c(f[2], &mut dc).unwrap_or(0) as u64;
+                            let b = parse_ts_c(f[3], &mut dc).unwrap_or(0) as u64;
+                            *sink = sink.wrapping_add(eq_key_at(f[0], dend) ^ eq_key_at(f[1], dend).rotate_left(9) ^ a ^ b.rotate_left(7));
                         }),
-                        4 => {
-                            let mut tmp = vec![std::mem::take(&mut st.3)];
-                            parse_events(d, &ctx, &mut tmp, &mut st.2);
-                            st.3 = std::mem::take(&mut tmp[0]);
-                        }
                         _ => parse_events(d, &ctx, &mut st.0, &mut st.2),
                     }
                 },
             );
             let el = t.elapsed().as_secs_f64();
+            std::hint::black_box(&states);
+            let recs: usize = states.iter().map(|s| s.0.iter().map(|v| v.len()).sum::<usize>()).sum();
+            std::hint::black_box(recs);
+            drop(states);
             line.push_str(&format!(" v{}={:.1}", variant, el * 1e9 * bt as f64 / lines as f64));
         }
-        eprintln!("{} ns/line/thread: tok,+ts,+keys,ts+keys,full-1bucket,full-1024", line);
+        eprintln!("{} ns/line/thread: tok,+ts,+keys,+ts+keys,full-1vec,full-1024", line);
         return;
     }
 
@@ -1644,6 +1659,8 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
             lcount: Vec::new(),
             lids: Vec::new(),
             loff: Vec::new(),
+            radix_tmp: Vec::new(),
+            radix_ctmp: Vec::new(),
         },
         |st, qi| timed!(A_SESS, {
             let q = order[qi].1;
@@ -1706,7 +1723,9 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
             }
             st.loff.push(acc);
             evs.clear();
-            evs.resize(n_ev, SRec { person: 0, ts: 0, pc: 0 });
+            evs.reserve(n_ev);
+            // SAFETY: SRec is plain data; the counting placement below writes every slot in 0..n_ev exactly once
+            unsafe { evs.set_len(n_ev) };
             {
                 let mut cur: Vec<u32> = st.loff[..np].to_vec();
                 let mut k = 0usize;
@@ -1750,7 +1769,9 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
             }
             coff[np] = acc;
             cks.clear();
-            cks.resize(acc as usize, CRec { person: 0, cid: 0, ts: 0, camp: 0 });
+            cks.reserve(acc as usize);
+            // SAFETY: as above, every slot in 0..acc is written exactly once
+            unsafe { cks.set_len(acc as usize) };
             {
                 let mut cur: Vec<u32> = coff[..np].to_vec();
                 let mut k = 0usize;
@@ -1770,11 +1791,11 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
             for l in 0..np {
                 let es = &mut evs[st.loff[l] as usize..st.loff[l + 1] as usize];
                 if es.len() > 1 {
-                    es.sort_unstable_by_key(|e| e.ts);
+                    sort_srec_by_ts(es, &mut st.radix_tmp);
                 }
                 let cs_ = &mut cks[coff[l] as usize..coff[l + 1] as usize];
                 if cs_.len() > 1 {
-                    cs_.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| cid_cmp(a.cid, b.cid, &ck_maps, longs)));
+                    sort_crec(cs_, &mut st.radix_ctmp, &ck_maps, longs);
                 }
                 let person = st.lkeys[l];
                 let (e0, e1) = (st.loff[l] as usize, st.loff[l + 1] as usize);
@@ -1842,6 +1863,74 @@ struct St {
     lcount: Vec<u32>,
     lids: Vec<u32>,
     loff: Vec<u32>,
+    radix_tmp: Vec<SRec>,
+    radix_ctmp: Vec<CRec>,
+}
+
+const RADIX_MIN: usize = 2048;
+
+/// LSD radix sort of u32 keys, 2 passes of 16 bits, stable. `tmp` is scratch.
+fn radix_sort_by<T: Copy>(v: &mut [T], tmp: &mut Vec<T>, key: impl Fn(&T) -> u32) {
+    let n = v.len();
+    tmp.clear();
+    tmp.reserve(n);
+    // SAFETY: T is Copy; every slot of tmp in 0..n is written by the scatter before it is read
+    unsafe { tmp.set_len(n) };
+    let mut c0 = vec![0u32; 1 << 16];
+    let mut c1 = vec![0u32; 1 << 16];
+    for x in v.iter() {
+        let k = key(x);
+        c0[(k & 0xFFFF) as usize] += 1;
+        c1[(k >> 16) as usize] += 1;
+    }
+    let (mut a0, mut a1) = (0u32, 0u32);
+    for i in 0..(1 << 16) {
+        let t0 = c0[i];
+        c0[i] = a0;
+        a0 += t0;
+        let t1 = c1[i];
+        c1[i] = a1;
+        a1 += t1;
+    }
+    for x in v.iter() {
+        let d = (key(x) & 0xFFFF) as usize;
+        tmp[c0[d] as usize] = *x;
+        c0[d] += 1;
+    }
+    for x in tmp.iter() {
+        let d = (key(x) >> 16) as usize;
+        v[c1[d] as usize] = *x;
+        c1[d] += 1;
+    }
+}
+
+fn sort_srec_by_ts(v: &mut [SRec], tmp: &mut Vec<SRec>) {
+    if v.len() >= RADIX_MIN {
+        radix_sort_by(v, tmp, |e| e.ts);
+    } else {
+        v.sort_unstable_by_key(|e| e.ts);
+    }
+}
+
+/// Sort clicks by (ts, click_id byte order).
+fn sort_crec(v: &mut [CRec], tmp: &mut Vec<CRec>, files: &[Option<Buf>], longs: &Longs) {
+    if v.len() >= RADIX_MIN {
+        radix_sort_by(v, tmp, |c| c.ts);
+        // resolve ties in ts by click id
+        let mut i = 0;
+        while i < v.len() {
+            let mut j = i + 1;
+            while j < v.len() && v[j].ts == v[i].ts {
+                j += 1;
+            }
+            if j - i > 1 {
+                v[i..j].sort_unstable_by(|a, b| cid_cmp(a.cid, b.cid, files, longs));
+            }
+            i = j;
+        }
+    } else {
+        v.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| cid_cmp(a.cid, b.cid, files, longs)));
+    }
 }
 
 fn flush_day(st: &mut St, person: u64, day: i32, sessions: u32, events: u32, revenue: i64) {
@@ -2127,6 +2216,26 @@ fn write_campaign_daily(path: &Path, camp: &[[i64; 4]], ndays: usize, day0: i64,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn radix_matches_sort() {
+        let mut x: u64 = 5;
+        for n in [0usize, 1, 2047, 2048, 5000, 70000] {
+            let mut v: Vec<SRec> = (0..n)
+                .map(|i| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    SRec { person: i as u64, ts: (x >> 20) as u32 % if i % 3 == 0 { 1000 } else { u32::MAX }, pc: 0 }
+                })
+                .collect();
+            let mut w = v.clone();
+            let mut tmp = Vec::new();
+            radix_sort_by(&mut v, &mut tmp, |e| e.ts);
+            w.sort_by_key(|e| e.ts); // stable, like LSD radix
+            assert!(v.iter().zip(w.iter()).all(|(a, b)| a.ts == b.ts && a.person == b.person));
+        }
+    }
 
     #[test]
     fn fast_key_win_matches() {
