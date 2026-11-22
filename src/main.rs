@@ -1128,6 +1128,40 @@ fn parse_f3_fast(f: &[u8], dend: usize) -> Option<i64> {
     parse_f3(f)
 }
 
+/// "HH:MM:SS" at f[11..19] -> ms of day (same checks as civil_ms_c). f.len() >= 19.
+#[inline(always)]
+fn hms_ms(f: &[u8]) -> Option<i64> {
+    let x = u64::from_le_bytes(f[11..19].try_into().unwrap()) ^ 0x3030_3A30_303A_3030;
+    if (x | x.wrapping_add(0x7676_7F76_767F_7676)) & 0x8080_8080_8080_8080 != 0 {
+        return None;
+    }
+    let h = (x & 0xFF) * 10 + ((x >> 8) & 0xFF);
+    let mi = ((x >> 24) & 0xFF) * 10 + ((x >> 32) & 0xFF);
+    let sec = ((x >> 48) & 0xFF) * 10 + (x >> 56);
+    if h > 23 || mi > 59 || sec > 59 {
+        return None;
+    }
+    Some(((h * 3600 + mi * 60 + sec) * 1000) as i64)
+}
+
+/// ts for an F1 `ts` on the same date as the (already valid F1) ingest field: exactly parse_ts of `t`.
+/// None means "use the general parser" (not this fast case).
+#[inline(always)]
+fn same_day_f1(t: &[u8], ing: &[u8], ingest: i64) -> Option<i64> {
+    if t.len() != 20 || ing.len() != 20 || t[19] != b'Z' {
+        return None;
+    }
+    let a = u64::from_le_bytes(t[0..8].try_into().unwrap()) ^ u64::from_le_bytes(ing[0..8].try_into().unwrap());
+    let b = (u32::from_le_bytes(t[7..11].try_into().unwrap()) ^ u32::from_le_bytes(ing[7..11].try_into().unwrap())) as u64;
+    if a | b != 0 {
+        return None;
+    }
+    // same YYYY-MM-DDT prefix: the date was validated with ingest; day start = ingest - its time of day
+    let ti = hms_ms(t)?;
+    let ii = hms_ms(ing).expect("ingest parsed as F1");
+    Some(ingest - ii + ti)
+}
+
 /// parse_ts with a date cache.
 #[inline(always)]
 fn parse_ts_c(f: &[u8], dc: &mut DateCache, dend: usize) -> Option<i64> {
@@ -1363,6 +1397,20 @@ fn parallel_fin<S: Send>(
 
 fn buckets<T>(n: usize, cap: usize) -> Vec<Vec<T>> {
     (0..n).map(|_| Vec::with_capacity(cap)).collect()
+}
+
+/// Returns a vector's pages to the kernel without freeing the allocation (it is never used again).
+fn release_vec<T>(v: Vec<T>) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let p = v.as_ptr() as usize;
+        let len = v.capacity() * std::mem::size_of::<T>();
+        let (a, e) = ((p + 4095) & !4095, (p + len) & !4095);
+        if e > a {
+            libc::madvise(a as *mut libc::c_void, e - a, libc::MADV_DONTNEED);
+        }
+    }
+    std::mem::forget(v);
 }
 
 /// One 64-byte cache line of K records.
@@ -1603,7 +1651,14 @@ fn parse_events(data: &[u8], c: &EvCtx, out: &mut NtBuckets<ERec, 2>, longs: &mu
             if f[1].is_empty() || f[5].is_empty() {
                 break 'v;
             }
-            let Some(ts) = parse_ts_c(f[2], &mut dc, dend) else { break 'v };
+            let ts = match same_day_f1(f[2], f[3], ingest) {
+                Some(v) => v,
+                None => {
+                    // not the fast case; note an F1 ts with a bad time on the same day also lands here
+                    let Some(v) = parse_ts_c(f[2], &mut dc, dend) else { break 'v };
+                    v
+                }
+            };
             if ts < c.ws || ts >= c.we || ingest - ts > DAY_MS {
                 break 'v;
             }
@@ -1742,14 +1797,28 @@ static DEDUP_DENSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 /// Marks every copy except the one with the smallest ingest_ts (per event_id) as dead.
 /// Records of bucket `b` are numbered across worker vectors in order.
 #[inline(never)]
-fn dedup_insert(ev_parts: &[Vec<Vec<ERec>>], b: usize, table: &mut Vec<Slot>, dead: &mut Vec<bool>) {
+fn dedup_insert(ev_parts: &[Vec<Vec<ERec>>], b: usize, table: &mut Vec<Slot>, dead: &mut Vec<bool>, epoch: &mut u32) {
     let n: usize = ev_parts.iter().map(|t| t[b].len()).sum();
+    assert!(n < 1 << 24, "dedup bucket too large");
     // dense: 1.5n rounded up (load 0.33-0.67), else 2n (load 0.25-0.5)
     let want = if DEDUP_DENSE.load(Ordering::Relaxed) { n + n / 2 } else { n * 2 };
     let cap = want.next_power_of_two().max(64);
     let mask = cap - 1;
-    table.clear();
-    table.resize(cap, Slot { eid: 0, ingest: 0, idx: u32::MAX });
+    // Epoch-stamped slots: a slot is filled iff the top 8 bits of idx equal this bucket's epoch, so
+    // the table (reused across buckets) needs no clearing except when it grows or the epoch wraps.
+    if table.len() < cap {
+        table.clear();
+        table.resize(cap, Slot { eid: 0, ingest: 0, idx: 0 });
+        *epoch = 0;
+    }
+    *epoch += 1;
+    if *epoch == 256 {
+        for s in table.iter_mut() {
+            s.idx = 0;
+        }
+        *epoch = 1;
+    }
+    let tag = *epoch << 24;
     dead.clear();
     dead.resize(n, false);
     let mut g = 0u32;
@@ -1758,15 +1827,15 @@ fn dedup_insert(ev_parts: &[Vec<Vec<ERec>>], b: usize, table: &mut Vec<Slot>, de
             let mut h = (mix(r.eid) as usize) & mask;
             loop {
                 let s = unsafe { table.get_unchecked_mut(h) };
-                if s.idx == u32::MAX {
-                    *s = Slot { eid: r.eid, ingest: r.ingest, idx: g };
+                if s.idx >> 24 != *epoch {
+                    *s = Slot { eid: r.eid, ingest: r.ingest, idx: tag | g };
                     break;
                 }
                 if s.eid == r.eid {
                     if r.ingest < s.ingest {
-                        dead[s.idx as usize] = true;
+                        dead[(s.idx & 0xFF_FFFF) as usize] = true;
                         s.ingest = r.ingest;
-                        s.idx = g;
+                        s.idx = tag | g;
                     } else {
                         dead[g as usize] = true;
                     }
@@ -2136,9 +2205,9 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
     let ev_paths = csv_files(&data_dir.join("events"));
     let ck_paths = csv_files(&data_dir.join("clicks"));
     let lk_paths = csv_files(&data_dir.join("links"));
-    let ev_maps = load_files(&ev_paths, cfg.read, threads);
+    let mut ev_maps = load_files(&ev_paths, cfg.read, threads);
     let ck_maps = load_files(&ck_paths, cfg.read, threads);
-    let lk_maps = load_files(&lk_paths, cfg.read, threads);
+    let mut lk_maps = load_files(&lk_paths, cfg.read, threads);
     let chunk_target = 2 << 20;
     let ev_chunks = make_chunks(&ev_maps, chunk_target);
     let ck_chunks = make_chunks(&ck_maps, chunk_target);
@@ -2246,6 +2315,7 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
         ev: Vec<Vec<SRec>>,
         ck: Vec<Vec<CRec>>,
         table: Vec<Slot>,
+        epoch: u32,
         dead: Vec<bool>,
         longs: LongMap,
     }
@@ -2254,11 +2324,11 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
     let mids: Vec<Mid> = parallel(
         threads,
         P + ck_chunks.len(),
-        || Mid { evb: Some(NtBuckets::new(Q, ev_cap)), ev: Vec::new(), ck: buckets(Q, ck_cap), table: Vec::new(), dead: Vec::new(), longs: LongMap::default() },
+        || Mid { evb: Some(NtBuckets::new(Q, ev_cap)), ev: Vec::new(), ck: buckets(Q, ck_cap), table: Vec::new(), epoch: 0, dead: Vec::new(), longs: LongMap::default() },
         |st, task| {
             if task < P {
                 let b = task;
-                timed!(A_INS, dedup_insert(&ev_parts, b, &mut st.table, &mut st.dead));
+                timed!(A_INS, dedup_insert(&ev_parts, b, &mut st.table, &mut st.dead, &mut st.epoch));
                 timed!(A_EMIT, dedup_emit(&ev_parts, b, &st.dead, &person_map, st.evb.as_mut().unwrap()));
             } else {
                 let c = &ck_chunks[task - P];
@@ -2267,7 +2337,23 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
         },
     );
 
-    std::mem::forget(ev_parts);
+    // Event records and the event/link file maps are dead from here on. Release them on a background
+    // thread so the kernel's page teardown overlaps the sessions phase instead of running
+    // single-threaded at process exit. Never joined: process::exit ends it.
+    let releaser = {
+        let ev_maps = std::mem::take(&mut ev_maps);
+        let lk_maps = std::mem::take(&mut lk_maps);
+        std::thread::spawn(move || {
+            for t in ev_parts {
+                for v in t {
+                    release_vec(v);
+                }
+            }
+            drop(ev_maps);
+            drop(lk_maps);
+        })
+    };
+    std::mem::forget(releaser);
     let mut mids = mids;
     for m in mids.iter_mut() {
         m.ev = m.evb.take().unwrap().finish();
@@ -2822,28 +2908,25 @@ fn write_user_daily(path: &Path, rows: &[URow], cats: &[Vec<u8>], longs: &Longs)
 
 fn write_user_daily_fast(path: &Path, rows: &[URow], cats: &[Vec<u8>], longs: &Longs) {
     let n = rows.len();
-    let mut ubytes: Vec<u8> = Vec::with_capacity(n * 12);
-    let mut uends: Vec<u32> = Vec::with_capacity(n);
+    // user_id as a dictionary: rows are grouped by person, so each person's bytes go into the
+    // dictionary once (a repeat entry would still be valid) and every row stores only an index
+    let mut ubytes: Vec<u8> = Vec::with_capacity(n * 4);
+    let mut uends: Vec<u32> = Vec::with_capacity(n / 2 + 16);
+    let mut uidx: Vec<u32> = Vec::with_capacity(n);
     let mut last = u64::MAX;
-    let mut last_range = (0usize, 0usize);
     let mut sb = [0u8; KEY_LEN];
     for r in rows {
         if r.person != last {
-            let start = ubytes.len();
             if r.person & SLOW != 0 {
                 ubytes.extend_from_slice(longs.get(r.person));
             } else {
                 let k = short_bytes(r.person, &mut sb);
                 ubytes.extend_from_slice(&sb[..k]);
             }
+            uends.push(ubytes.len() as u32);
             last = r.person;
-            last_range = (start, ubytes.len());
-        } else {
-            // repeat the person's bytes (PLAIN encoding stores each value)
-            let (a, b) = last_range;
-            ubytes.extend_from_within(a..b);
         }
-        uends.push(ubytes.len() as u32);
+        uidx.push(uends.len() as u32 - 1);
     }
     let day: Vec<i32> = rows.iter().map(|r| r.day).collect();
     let ses: Vec<i32> = rows.iter().map(|r| r.sessions as i32).collect();
@@ -2860,7 +2943,7 @@ fn write_user_daily_fast(path: &Path, rows: &[URow], cats: &[Vec<u8>], longs: &L
     pq::write(
         path,
         &[
-            pq::Col::Str { name: "user_id", bytes: &ubytes, ends: &uends },
+            pq::Col::DictStr { name: "user_id", dbytes: &ubytes, dends: &uends, idx: &uidx },
             pq::Col::Date { name: "day", vals: &day },
             pq::Col::I32 { name: "sessions", vals: &ses },
             pq::Col::I32 { name: "events", vals: &evn },
@@ -3236,6 +3319,28 @@ mod tests {
             v.extend_from_slice(&[b'9'; 16]);
             let dend = v.as_ptr() as usize + v.len();
             assert_eq!(parse_f3_fast(&v[..s.len()], dend), parse_f3(s));
+        }
+    }
+
+    #[test]
+    fn same_day_f1_matches() {
+        let mut dc = DateCache::new();
+        let ings: Vec<&[u8]> = vec![b"2026-10-03T23:58:10Z", b"2028-02-29T00:00:00Z", b"2026-10-03T00:00:00Z"];
+        let tss: Vec<&[u8]> = vec![
+            b"2026-10-03T23:58:10Z", b"2026-10-03T00:00:00Z", b"2026-10-03T24:00:00Z", b"2026-10-03T23:60:00Z",
+            b"2026-10-03T23:00:60Z", b"2026-10-03t23:00:00Z", b"2026-10-03T23:00:00z", b"2026-10-03T1a:00:00Z",
+            b"2028-02-29T12:34:56Z", b"2026-10-03T19:58:10-04:00", b"1791071890000", b"2026-10-04T00:00:00Z",
+            b"2026-10-03 23:58:10Z", b"2026-10-03T23:58:10ZZ", b"", b"2028-02-29T23:59:59Z",
+        ];
+        for ing in &ings {
+            let iv = parse_ts(ing).unwrap();
+            for t in &tss {
+                let got = match same_day_f1(t, ing, iv) {
+                    Some(v) => Some(v),
+                    None => parse_ts_c(t, &mut dc, t.as_ptr() as usize + t.len()),
+                };
+                assert_eq!(got, parse_ts(t), "ts {:?} ing {:?}", String::from_utf8_lossy(t), String::from_utf8_lossy(ing));
+            }
         }
     }
 
