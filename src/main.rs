@@ -1100,31 +1100,6 @@ fn civil_ms_c(f: &[u8], dc: &mut DateCache) -> Option<i64> {
     Some(day + ((h * 3600 + mi * 60 + sec) * 1000) as i64)
 }
 
-/// Clock time of an F1/F2 field, milliseconds since midnight. `f` is at least 19 bytes.
-#[inline(always)]
-fn tod_ms(f: &[u8]) -> Option<i64> {
-    let x = u64::from_le_bytes(f[11..19].try_into().unwrap()) ^ 0x3030_3A30_303A_3030;
-    if (x | x.wrapping_add(0x7676_7F76_767F_7676)) & 0x8080_8080_8080_8080 != 0 {
-        return None;
-    }
-    let h = (x & 0xFF) * 10 + ((x >> 8) & 0xFF);
-    let mi = ((x >> 24) & 0xFF) * 10 + ((x >> 32) & 0xFF);
-    let sec = ((x >> 48) & 0xFF) * 10 + (x >> 56);
-    if h > 23 || mi > 59 || sec > 59 {
-        return None;
-    }
-    Some(((h * 3600 + mi * 60 + sec) * 1000) as i64)
-}
-
-#[inline(always)]
-fn date10_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() >= 10
-        && b.len() >= 10
-        && u64::from_le_bytes(a[..8].try_into().unwrap()) == u64::from_le_bytes(b[..8].try_into().unwrap())
-        && a[8] == b[8]
-        && a[9] == b[9]
-}
-
 /// 8 ASCII digits (byte 0 most significant) -> value; None unless all are digits.
 #[inline(always)]
 fn digits8(v: u64) -> Option<u64> {
@@ -1628,23 +1603,7 @@ fn parse_events(data: &[u8], c: &EvCtx, out: &mut NtBuckets<ERec, 2>, longs: &mu
             if f[1].is_empty() || f[5].is_empty() {
                 break 'v;
             }
-            // ingest_ts is always F1. A ts that is also F1 on that same calendar day
-            // (the `T` separator included, so a space or other mark still fails) reuses
-            // the UTC midnight already computed for ingest and only parses HH:MM:SS.
-            let ts = if f[3].len() == 20
-                && f[3][19] == b'Z'
-                && f[3][10] == b'T'
-                && f[2].len() == 20
-                && f[2][19] == b'Z'
-                && f[2][10] == b'T'
-                && date10_eq(f[3], f[2])
-            {
-                let Some(tod) = tod_ms(f[2]) else { break 'v };
-                ingest.div_euclid(DAY_MS) * DAY_MS + tod
-            } else {
-                let Some(ts) = parse_ts_c(f[2], &mut dc, dend) else { break 'v };
-                ts
-            };
+            let Some(ts) = parse_ts_c(f[2], &mut dc, dend) else { break 'v };
             if ts < c.ws || ts >= c.we || ingest - ts > DAY_MS {
                 break 'v;
             }
@@ -1783,23 +1742,14 @@ static DEDUP_DENSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 /// Marks every copy except the one with the smallest ingest_ts (per event_id) as dead.
 /// Records of bucket `b` are numbered across worker vectors in order.
 #[inline(never)]
-fn dedup_insert(ev_parts: &[Vec<Vec<ERec>>], b: usize, table: &mut Vec<Slot>, epochs: &mut Vec<u32>, epoch: &mut u32, dead: &mut Vec<bool>) {
+fn dedup_insert(ev_parts: &[Vec<Vec<ERec>>], b: usize, table: &mut Vec<Slot>, dead: &mut Vec<bool>) {
     let n: usize = ev_parts.iter().map(|t| t[b].len()).sum();
     // dense: 1.5n rounded up (load 0.33-0.67), else 2n (load 0.25-0.5)
     let want = if DEDUP_DENSE.load(Ordering::Relaxed) { n + n / 2 } else { n * 2 };
     let cap = want.next_power_of_two().max(64);
-    // Keep the thread's table. A per-slot epoch marks live entries so empty
-    // slots are not rewritten between buckets.
-    *epoch = epoch.wrapping_add(1);
-    if epochs.len() < cap || *epoch == 0 {
-        *epoch = 1;
-        table.clear();
-        table.resize(cap, Slot { eid: 0, ingest: 0, idx: u32::MAX });
-        epochs.resize(cap, 0);
-        epochs.fill(0);
-    }
-    let mask = epochs.len() - 1;
-    let ep = *epoch;
+    let mask = cap - 1;
+    table.clear();
+    table.resize(cap, Slot { eid: 0, ingest: 0, idx: u32::MAX });
     dead.clear();
     dead.resize(n, false);
     let mut g = 0u32;
@@ -1807,14 +1757,11 @@ fn dedup_insert(ev_parts: &[Vec<Vec<ERec>>], b: usize, table: &mut Vec<Slot>, ep
         for r in t[b].iter() {
             let mut h = (mix(r.eid) as usize) & mask;
             loop {
-                if unsafe { *epochs.get_unchecked(h) } != ep {
-                    unsafe {
-                        *epochs.get_unchecked_mut(h) = ep;
-                        *table.get_unchecked_mut(h) = Slot { eid: r.eid, ingest: r.ingest, idx: g };
-                    }
+                let s = unsafe { table.get_unchecked_mut(h) };
+                if s.idx == u32::MAX {
+                    *s = Slot { eid: r.eid, ingest: r.ingest, idx: g };
                     break;
                 }
-                let s = unsafe { table.get_unchecked_mut(h) };
                 if s.eid == r.eid {
                     if r.ingest < s.ingest {
                         dead[s.idx as usize] = true;
@@ -2299,8 +2246,6 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
         ev: Vec<Vec<SRec>>,
         ck: Vec<Vec<CRec>>,
         table: Vec<Slot>,
-        epochs: Vec<u32>,
-        epoch: u32,
         dead: Vec<bool>,
         longs: LongMap,
     }
@@ -2309,11 +2254,11 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
     let mids: Vec<Mid> = parallel(
         threads,
         P + ck_chunks.len(),
-        || Mid { evb: Some(NtBuckets::new(Q, ev_cap)), ev: Vec::new(), ck: buckets(Q, ck_cap), table: Vec::new(), epochs: Vec::new(), epoch: 0, dead: Vec::new(), longs: LongMap::default() },
+        || Mid { evb: Some(NtBuckets::new(Q, ev_cap)), ev: Vec::new(), ck: buckets(Q, ck_cap), table: Vec::new(), dead: Vec::new(), longs: LongMap::default() },
         |st, task| {
             if task < P {
                 let b = task;
-                timed!(A_INS, dedup_insert(&ev_parts, b, &mut st.table, &mut st.epochs, &mut st.epoch, &mut st.dead));
+                timed!(A_INS, dedup_insert(&ev_parts, b, &mut st.table, &mut st.dead));
                 timed!(A_EMIT, dedup_emit(&ev_parts, b, &st.dead, &person_map, st.evb.as_mut().unwrap()));
             } else {
                 let c = &ck_chunks[task - P];
@@ -2493,6 +2438,9 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
             }
             for l in 0..np {
                 let es = &mut evs[st.loff[l] as usize..st.loff[l + 1] as usize];
+                if es.len() > 1 {
+                    sort_ev(es, &mut st.radix_tmp);
+                }
                 let cs_ = &mut cks[coff[l] as usize..coff[l + 1] as usize];
                 if cs_.len() > 1 {
                     sort_crec(cs_, &mut st.radix_ctmp, &ck_maps, longs);
@@ -2500,17 +2448,7 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
                 let person = st.lkeys[l];
                 let (e0, e1) = (st.loff[l] as usize, st.loff[l + 1] as usize);
                 let (c0, c1) = (coff[l] as usize, coff[l + 1] as usize);
-                // A large person's events fit in 30-minute slots. Every pair inside
-                // one slot is under 30 minutes, so sessions are runs of occupied
-                // slots and the events themselves are not sorted.
-                if es.len() >= RADIX_MIN {
-                    process_person_bins(st, person, &evs[e0..e1], &cks[c0..c1], ws, day0, ndays, organic);
-                } else {
-                    if es.len() > 1 {
-                        sort_ev(es, &mut st.radix_tmp);
-                    }
-                    process_person(st, person, &evs[e0..e1], &cks[c0..c1], ws, day0, ndays, organic);
-                }
+                process_person(st, person, &evs[e0..e1], &cks[c0..c1], ws, day0, ndays, organic);
             }
             st.evs = evs;
             st.cks = cks;
@@ -2668,146 +2606,6 @@ fn flush_day(st: &mut St, person: u64, day: i32, sessions: u32, events: u32, rev
     }
     st.cat_touched.clear();
     st.rows.push(URow { person, day, sessions, events, revenue, top });
-}
-
-/// Sessions for one large person without sorting its events.
-///
-/// Slot width is 30 minutes, so events in one slot stay in one session. The
-/// next occupied slot joins only when its earliest event is at most 30 minutes
-/// after this slot's latest. Purchases are sorted on their own.
-#[allow(clippy::too_many_arguments)]
-fn process_person_bins(st: &mut St, person: u64, evs: &[u64], pc: &[CRec], ws: i64, day0: i64, ndays: usize, organic: u32) {
-    const W: i64 = 1_800_000;
-    let mut max_ts = 0u32;
-    for e in evs {
-        let ts = (*e >> 32) as u32;
-        if ts > max_ts {
-            max_ts = ts;
-        }
-    }
-    let nslots = (max_ts as usize) / (W as usize) + 1;
-    #[derive(Clone)]
-    struct Bin {
-        min: u32,
-        max: u32,
-        n: u32,
-    }
-    let mut bins = vec![Bin { min: u32::MAX, max: 0, n: 0 }; nslots];
-    let mut buys: Vec<(u32, u32)> = Vec::new();
-    for e in evs {
-        let ts = (*e >> 32) as u32;
-        let pcw = *e as u32;
-        let b = &mut bins[(ts as usize) / (W as usize)];
-        if ts < b.min {
-            b.min = ts;
-        }
-        if ts > b.max {
-            b.max = ts;
-        }
-        b.n += 1;
-        if pcw != 0 {
-            buys.push((ts, pcw));
-        }
-    }
-    buys.sort_unstable_by_key(|b| b.0);
-
-    let week = 7 * DAY_MS;
-    let mut lo = 0usize;
-    let mut hi = 0usize;
-    let mut cur_day: i32 = i32::MIN;
-    let (mut u_sess, mut u_ev, mut u_rev) = (0u32, 0u32, 0i64);
-    let mut bi = 0usize;
-    let mut buy_i = 0usize;
-    while bi < nslots {
-        while bi < nslots && bins[bi].n == 0 {
-            bi += 1;
-        }
-        if bi >= nslots {
-            break;
-        }
-        let smin = bins[bi].min;
-        let mut smax = bins[bi].max;
-        let mut sevents = bins[bi].n;
-        bi += 1;
-        while bi < nslots && bins[bi].n > 0 && (bins[bi].min as i64) - (smax as i64) <= W {
-            if bins[bi].max > smax {
-                smax = bins[bi].max;
-            }
-            sevents += bins[bi].n;
-            bi += 1;
-        }
-        let start = smin as i64;
-        let day = (ws + start).div_euclid(DAY_MS) as i32;
-        if day != cur_day {
-            if cur_day != i32::MIN {
-                flush_day(st, person, cur_day, u_sess, u_ev, u_rev);
-            }
-            cur_day = day;
-            u_sess = 0;
-            u_ev = 0;
-            u_rev = 0;
-        }
-        let mut rev = 0i64;
-        let mut purch = false;
-        while buy_i < buys.len() && buys[buy_i].0 <= smax {
-            let epc = buys[buy_i].1;
-            purch = true;
-            let price = (epc >> 8) as i64;
-            rev += price;
-            let c = (epc & 0xFF) as usize;
-            if st.cat_sum[c] == 0 {
-                st.cat_touched.push(c as u16);
-            }
-            st.cat_sum[c] += price as u64;
-            buy_i += 1;
-        }
-        u_sess += 1;
-        u_ev += sevents;
-        u_rev += rev;
-
-        if !pc.is_empty() {
-            let sc = start + week;
-            while hi < pc.len() && (pc[hi].ts as i64) <= sc {
-                let c = pc[hi].camp as usize;
-                if st.counts[c] == 0 {
-                    st.pos[c] = st.active.len() as u32;
-                    st.active.push(c as u32);
-                }
-                st.counts[c] += 1;
-                hi += 1;
-            }
-            while lo < hi && (pc[lo].ts as i64) < sc - week {
-                remove_click(st, pc[lo].camp as usize);
-                lo += 1;
-            }
-        }
-        let di = (day as i64 - day0) as usize;
-        let credit = if hi > lo {
-            let t = pc[hi - 1].ts;
-            let mut f = hi - 1;
-            while f > lo && pc[f - 1].ts == t {
-                f -= 1;
-            }
-            pc[f].camp
-        } else {
-            organic
-        };
-        let cell = &mut st.camp[credit as usize * ndays + di];
-        cell.s += 1;
-        cell.p += purch as u32;
-        cell.rev += rev;
-        for ai in 0..st.active.len() {
-            let a = st.active[ai] as usize;
-            st.assist[a * ndays + di] += 1;
-        }
-    }
-    if cur_day != i32::MIN {
-        flush_day(st, person, cur_day, u_sess, u_ev, u_rev);
-    }
-    for &a in &st.active {
-        st.counts[a as usize] = 0;
-    }
-    st.active.clear();
 }
 
 #[allow(clippy::too_many_arguments)]
