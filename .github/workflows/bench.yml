@@ -4,7 +4,7 @@ on:
     branches: [bench]
   workflow_dispatch:
 env:
-  BASE: c289682d436ce644a60017cda29d93ef0e633386
+  BASE: bb89c72ddcb917930016e052797a6090012f8a5c
 jobs:
   bench:
     runs-on: ubuntu-latest

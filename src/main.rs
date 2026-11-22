@@ -1726,19 +1726,8 @@ fn parse_clicks(
 
 fn build_person_map(maps: &[Option<Buf>], chunks: &[Chunk]) -> (PersonMap, LongMap) {
     let mut longs = LongMap::default();
-    let mut ids: FastMap<u64, u32> = FastMap::default();
-    let mut keys: Vec<u64> = Vec::new();
-    let mut parent: Vec<u32> = Vec::new();
-    fn find(p: &mut [u32], mut x: u32) -> u32 {
-        while p[x as usize] != x {
-            let g = p[p[x as usize] as usize];
-            p[x as usize] = g;
-            x = g;
-        }
-        x
-    }
     let total: usize = chunks.iter().map(|c| c.end - c.start).sum();
-    ids.reserve(total / 12);
+    let mut pairs: Vec<[u64; 2]> = Vec::with_capacity(total / 12 + 16);
     for c in chunks {
         let d = chunk_data(maps, c);
         let dend = d.as_ptr() as usize + d.len();
@@ -1748,32 +1737,90 @@ fn build_person_map(maps: &[Option<Buf>], chunks: &[Chunk]) -> (PersonMap, LongM
             }
             let a = key_at(f[0], dend, &mut longs);
             let b = key_at(f[1], dend, &mut longs);
-            if a == b {
-                return;
-            }
-            let mut id = |k: u64| -> u32 {
-                *ids.entry(k).or_insert_with(|| {
-                    let i = keys.len() as u32;
-                    keys.push(k);
-                    parent.push(i);
-                    i
-                })
-            };
-            let ia = id(a);
-            let ib = id(b);
-            let ra = find(&mut parent, ia);
-            let rb = find(&mut parent, ib);
-            if ra != rb {
-                if ra < rb {
-                    parent[rb as usize] = ra;
-                } else {
-                    parent[ra as usize] = rb;
-                }
+            if a != b {
+                pairs.push([a, b]);
             }
         });
     }
-    let lv = Longs(vec![&longs]);
+    // Dense ids without a big random-access hash map: partition the 2m key occurrences by hash so
+    // each partition's table fits in cache, then assign ids partition by partition.
+    let m = pairs.len();
+    const RB: u32 = 10;
+    const R: usize = 1 << RB;
+    let part = |k: u64| (mix(k) >> (64 - RB)) as usize;
+    let mut off = vec![0u32; R + 1];
+    for p in &pairs {
+        off[part(p[0]) + 1] += 1;
+        off[part(p[1]) + 1] += 1;
+    }
+    for r in 0..R {
+        off[r + 1] += off[r];
+    }
+    let mut occ: Vec<(u64, u32)> = Vec::with_capacity(2 * m);
+    // SAFETY: every slot in 0..2m is written exactly once by the scatter below
+    unsafe { occ.set_len(2 * m) };
+    {
+        let mut cur: Vec<u32> = off[..R].to_vec();
+        for (i, p) in pairs.iter().enumerate() {
+            for side in 0..2 {
+                let k = p[side];
+                let r = part(k);
+                unsafe { *occ.get_unchecked_mut(cur[r] as usize) = (k, (2 * i + side) as u32) };
+                cur[r] += 1;
+            }
+        }
+    }
+    drop(pairs);
+    let mut idx: Vec<u32> = vec![0; 2 * m];
+    let mut keys: Vec<u64> = Vec::with_capacity(m + 16);
+    let mut table: Vec<(u64, u32)> = Vec::new();
+    for r in 0..R {
+        let seg = &occ[off[r] as usize..off[r + 1] as usize];
+        let cap = (seg.len() * 2).next_power_of_two().max(16);
+        let mask = cap - 1;
+        table.clear();
+        table.resize(cap, (0, 0)); // key 0 never occurs
+        for &(k, o) in seg {
+            let mut h = (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 20) as usize & mask;
+            let id = loop {
+                let sl = unsafe { table.get_unchecked_mut(h) };
+                if sl.0 == k {
+                    break sl.1;
+                }
+                if sl.0 == 0 {
+                    let id = keys.len() as u32;
+                    *sl = (k, id);
+                    keys.push(k);
+                    break id;
+                }
+                h = (h + 1) & mask;
+            };
+            unsafe { *idx.get_unchecked_mut(o as usize) = id };
+        }
+    }
+    drop(occ);
+    fn find(p: &mut [u32], mut x: u32) -> u32 {
+        while p[x as usize] != x {
+            let g = p[p[x as usize] as usize];
+            p[x as usize] = g;
+            x = g;
+        }
+        x
+    }
     let n = keys.len();
+    let mut parent: Vec<u32> = (0..n as u32).collect();
+    for i in 0..m {
+        let ra = find(&mut parent, idx[2 * i]);
+        let rb = find(&mut parent, idx[2 * i + 1]);
+        if ra != rb {
+            if ra < rb {
+                parent[rb as usize] = ra;
+            } else {
+                parent[ra as usize] = rb;
+            }
+        }
+    }
+    let lv = Longs(vec![&longs]);
     let mut name: Vec<u64> = vec![u64::MAX; n];
     let mut has = vec![false; n];
     for i in 0..n {
