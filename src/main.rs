@@ -497,7 +497,7 @@ unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
 #[inline(always)]
 #[inline(always)]
 fn scan_lines<'a, const N: usize>(data: &'a [u8], on_line: impl FnMut(&[&'a [u8]; N])) {
-    scan_lines6::<N>(data, on_line)
+    scan_lines_ref::<N>(data, on_line)
 }
 
 #[inline(always)]
@@ -526,96 +526,6 @@ fn scan_lines_ref<'a, const N: usize>(data: &'a [u8], mut on_line: impl FnMut(&[
             }
             nf += 1;
         }};
-    }
-    while base < len {
-        let (mut sep, nl, q) = if base + 64 <= len {
-            unsafe { masks(data.as_ptr().add(base)) }
-        } else {
-            tail = [0u8; 64];
-            tail[..len - base].copy_from_slice(&data[base..]);
-            unsafe { masks(tail.as_ptr()) }
-        };
-        while sep != 0 {
-            let off = sep.trailing_zeros();
-            let bit = 1u64 << off;
-            sep &= sep - 1;
-            let p = base + off as usize;
-            field!(p);
-            if nl & bit != 0 {
-                let qnow = qbefore + (q & (bit - 1)).count_ones();
-                if nf == N && qnow - line_q0 == expect {
-                    on_line(&fields);
-                }
-                line_q0 = qnow;
-                nf = 0;
-                expect = 0;
-            }
-            fstart = p + 1;
-        }
-        qbefore += q.count_ones();
-        base += 64;
-    }
-    if fstart < len || (len > 0 && data[len - 1] == b',') {
-        field!(len);
-        if nf == N && qbefore - line_q0 == expect {
-            on_line(&fields);
-        }
-    }
-}
-
-#[inline(always)]
-fn scan_lines6<'a, const N: usize>(data: &'a [u8], mut on_line: impl FnMut(&[&'a [u8]; N])) {
-    let mut fields: [&'a [u8]; N] = [&[]; N];
-    let mut nf = 0usize;
-    let mut fstart = 0usize;
-    let mut expect = 0u32;
-    let mut qbefore = 0u32;
-    let mut line_q0 = 0u32;
-    let len = data.len();
-    let mut base = 0usize;
-    let mut tail = [0u8; 64];
-    macro_rules! field {
-        ($end:expr) => {{
-            let end = $end;
-            if nf < N {
-                let fl = end - fstart;
-                let w = if fl >= 2 {
-                    unsafe { (*data.get_unchecked(fstart) == b'"') & (*data.get_unchecked(end - 1) == b'"') }
-                } else {
-                    false
-                } as usize;
-                fields[nf] = unsafe { data.get_unchecked(fstart + w..end - w) };
-                expect += 2 * w as u32;
-            }
-            nf += 1;
-        }};
-    }
-    // 128-byte super-blocks: the inner loop exits half as often (its exit is a random branch)
-    while base + 128 <= len {
-        let (s0, n0, q0) = unsafe { masks(data.as_ptr().add(base)) };
-        let (s1, n1, q1) = unsafe { masks(data.as_ptr().add(base + 64)) };
-        let mut sep = s0 as u128 | ((s1 as u128) << 64);
-        let nl = n0 as u128 | ((n1 as u128) << 64);
-        let q = q0 as u128 | ((q1 as u128) << 64);
-        while sep != 0 {
-            let off = sep.trailing_zeros();
-            let bit = 1u128 << off;
-            sep &= sep - 1;
-            let p = base + off as usize;
-            field!(p);
-            if nl & bit != 0 {
-                let qnow = qbefore + (q & (bit - 1)).count_ones();
-                if nf == N && qnow - line_q0 == expect {
-                    on_line(&fields);
-                }
-                line_q0 = qnow;
-                nf = 0;
-                expect = 0;
-            }
-            fstart = p + 1;
-        }
-        qbefore += q.count_ones();
-        base += 128;
     }
     while base < len {
         let (mut sep, nl, q) = if base + 64 <= len {
@@ -3241,13 +3151,6 @@ mod tests {
                 }
             }
             assert_eq!(c, d, "round {} n {}", round, n);
-            let mut h: Vec<Vec<Vec<u8>>> = Vec::new();
-            match n {
-                2 => scan_lines6::<2>(&v, |f| h.push(f.iter().map(|x| x.to_vec()).collect())),
-                4 => scan_lines6::<4>(&v, |f| h.push(f.iter().map(|x| x.to_vec()).collect())),
-                _ => scan_lines6::<7>(&v, |f| h.push(f.iter().map(|x| x.to_vec()).collect())),
-            }
-            assert_eq!(c, h, "scan_lines6 round {} n {}", round, n);
             let mut e: Vec<Vec<Vec<u8>>> = Vec::new();
             match n {
                 2 => scan_lines4::<2>(&v, |f| e.push(f.iter().map(|x| x.to_vec()).collect())),
@@ -3304,13 +3207,6 @@ mod tests {
                     _ => scan_lines3::<7>(&v, |f| d.push(f.iter().map(|x| x.to_vec()).collect())),
                 }
                 assert_eq!(c, d, "scan_lines3 round {} n {}", round, n);
-                let mut h: Vec<Vec<Vec<u8>>> = Vec::new();
-                match n {
-                    2 => scan_lines6::<2>(&v, |f| h.push(f.iter().map(|x| x.to_vec()).collect())),
-                    4 => scan_lines6::<4>(&v, |f| h.push(f.iter().map(|x| x.to_vec()).collect())),
-                    _ => scan_lines6::<7>(&v, |f| h.push(f.iter().map(|x| x.to_vec()).collect())),
-                }
-                assert_eq!(c, h, "scan_lines6 round {} n {}", round, n);
                 let mut e: Vec<Vec<Vec<u8>>> = Vec::new();
                 match n {
                     2 => scan_lines4::<2>(&v, |f| e.push(f.iter().map(|x| x.to_vec()).collect())),
