@@ -1043,6 +1043,37 @@ fn parallel<S: Send>(threads: usize, tasks: usize, init: impl Fn() -> S + Sync, 
     })
 }
 
+/// Like `parallel`, but runs `fin(state, worker_index)` on each worker after it runs out of tasks.
+fn parallel_fin<S: Send>(
+    threads: usize,
+    tasks: usize,
+    init: impl Fn() -> S + Sync,
+    work: impl Fn(&mut S, usize) + Sync,
+    fin: impl Fn(&mut S, usize) + Sync,
+) -> Vec<S> {
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..threads)
+            .map(|wi| {
+                let (next, init, work, fin) = (&next, &init, &work, &fin);
+                sc.spawn(move || {
+                    let mut st = init();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= tasks {
+                            break;
+                        }
+                        work(&mut st, i);
+                    }
+                    fin(&mut st, wi);
+                    st
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    })
+}
+
 fn buckets<T>(n: usize, cap: usize) -> Vec<Vec<T>> {
     (0..n).map(|_| Vec::with_capacity(cap)).collect()
 }
@@ -1275,12 +1306,16 @@ impl PersonMap {
     }
 }
 
+static DEDUP_DENSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Marks every copy except the one with the smallest ingest_ts (per event_id) as dead.
 /// Records of bucket `b` are numbered across worker vectors in order.
 #[inline(never)]
 fn dedup_insert(ev_parts: &[Vec<Vec<ERec>>], b: usize, table: &mut Vec<Slot>, dead: &mut Vec<bool>) {
     let n: usize = ev_parts.iter().map(|t| t[b].len()).sum();
-    let cap = (n * 2).next_power_of_two().max(64);
+    // dense: 1.5n rounded up (load 0.33-0.67), else 2n (load 0.25-0.5)
+    let want = if DEDUP_DENSE.load(Ordering::Relaxed) { n + n / 2 } else { n * 2 };
+    let cap = want.next_power_of_two().max(64);
     let mask = cap - 1;
     table.clear();
     table.resize(cap, Slot { eid: 0, ingest: 0, idx: u32::MAX });
@@ -1478,6 +1513,7 @@ struct Cfg {
     read: bool,
     p: usize,
     q: usize,
+    dense: bool,
 }
 
 fn env_usize(k: &str, d: usize) -> usize {
@@ -1497,6 +1533,7 @@ fn main() {
         read: env_usize("SS_READ", 0) == 1,
         p: env_usize("SS_P", 1024).next_power_of_two(),
         q: env_usize("SS_Q", 1024).next_power_of_two(),
+        dense: env_usize("SS_DENSE", 0) == 1,
     };
     #[cfg(feature = "diag")]
     {
@@ -1514,11 +1551,11 @@ fn main() {
             eprintln!("generate 20M: {:?} in {:.2}s", st, t.elapsed().as_secs_f64());
             let big_out = scratch.join("out20");
             let big = [
-                Cfg { threads, read: false, p: 1024, q: 1024 },
-                Cfg { threads, read: false, p: 1024, q: 1024 },
-                Cfg { threads, read: false, p: 1024, q: 1024 },
-                Cfg { threads, read: false, p: 256, q: 1024 },
-                Cfg { threads: 1, read: false, p: 1024, q: 1024 },
+                Cfg { threads, read: false, p: 1024, q: 1024, dense: false },
+                Cfg { threads, read: false, p: 1024, q: 1024, dense: false },
+                Cfg { threads, read: false, p: 1024, q: 1024, dense: false },
+                Cfg { threads, read: false, p: 256, q: 1024, dense: false },
+                Cfg { threads: 1, read: false, p: 1024, q: 1024, dense: false },
             ];
             for c in &big {
                 let _ = std::fs::remove_dir_all(&big_out);
@@ -1539,15 +1576,15 @@ fn main() {
         }
         let configs: [Cfg; 0] = [];
         let _unused = [
-            Cfg { threads, read: false, p: 1024, q: 1024 },
-            Cfg { threads, read: true, p: 1024, q: 1024 },
-            Cfg { threads, read: true, p: 256, q: 256 },
-            Cfg { threads, read: true, p: 64, q: 64 },
-            Cfg { threads, read: false, p: 64, q: 64 },
-            Cfg { threads: 4, read: true, p: 1024, q: 1024 },
-            Cfg { threads: 1, read: true, p: 1024, q: 1024 },
-            Cfg { threads: 1, read: true, p: 64, q: 64 },
-            Cfg { threads, read: true, p: 1024, q: 1024 },
+            Cfg { threads, read: false, p: 1024, q: 1024, dense: false },
+            Cfg { threads, read: true, p: 1024, q: 1024, dense: false },
+            Cfg { threads, read: true, p: 256, q: 256, dense: false },
+            Cfg { threads, read: true, p: 64, q: 64, dense: false },
+            Cfg { threads, read: false, p: 64, q: 64, dense: false },
+            Cfg { threads: 4, read: true, p: 1024, q: 1024, dense: false },
+            Cfg { threads: 1, read: true, p: 1024, q: 1024, dense: false },
+            Cfg { threads: 1, read: true, p: 64, q: 64, dense: false },
+            Cfg { threads, read: true, p: 1024, q: 1024, dense: false },
         ];
         for c in &configs {
             pipeline(c, &data_dir, &out_dir);
@@ -1566,6 +1603,7 @@ fn main() {
 
 fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
     let t0 = Instant::now();
+    DEDUP_DENSE.store(cfg.dense, Ordering::Relaxed);
     let threads = cfg.threads;
     let manifest = std::fs::read_to_string(data_dir.join("manifest.json")).expect("manifest");
     let ws = manifest_ts(&manifest, "window_start");
@@ -1749,7 +1787,11 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
     let ncat = cat_names.len();
     let mut order: Vec<(usize, usize)> = (0..Q).map(|q| (mids.iter().map(|m| m.ev[q].len()).sum::<usize>(), q)).collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
-    let states: Vec<St> = parallel(
+    let ud_dir = out_dir.join("user_daily");
+    let cd_dir = out_dir.join("campaign_daily");
+    std::fs::create_dir_all(&ud_dir).unwrap();
+    std::fs::create_dir_all(&cd_dir).unwrap();
+    let states: Vec<St> = parallel_fin(
         threads,
         Q,
         || St {
@@ -1913,6 +1955,11 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
             st.evs = evs;
             st.cks = cks;
         }),
+        |st, wi| {
+            // write this worker's user_daily rows while other workers finish their buckets
+            let path = ud_dir.join(format!("part-{:05}.parquet", wi));
+            timed!(A_WRITE, write_user_daily(&path, &st.rows, &cat_names, longs));
+        },
     );
     let mids = std::mem::ManuallyDrop::new(mids);
     let _ = &mids;
@@ -1929,21 +1976,8 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
     }
 
     log(&t0, "campaigns merged");
-    // ---- write outputs
-    let ud_dir = out_dir.join("user_daily");
-    let cd_dir = out_dir.join("campaign_daily");
-    std::fs::create_dir_all(&ud_dir).unwrap();
-    std::fs::create_dir_all(&cd_dir).unwrap();
-    std::thread::scope(|sc| {
-        for (ti, s) in states.iter().enumerate() {
-            let path = ud_dir.join(format!("part-{:05}.parquet", ti));
-            let cat_names = &cat_names;
-            sc.spawn(move || timed!(A_WRITE, write_user_daily(&path, &s.rows, cat_names, longs)));
-        }
-        let path = cd_dir.join("part-00000.parquet");
-        let (camp, camp_ids, camp_channels) = (&camp, &camp_ids, &camp_channels);
-        sc.spawn(move || write_campaign_daily(&path, camp, ndays, day0, camp_ids, camp_channels));
-    });
+    // ---- write campaign_daily (user_daily was written by the session workers)
+    write_campaign_daily(&cd_dir.join("part-00000.parquet"), &camp, ndays, day0, &camp_ids, &camp_channels);
     log(&t0, "done");
     if !cfg!(feature = "diag") {
         std::mem::forget(states);
