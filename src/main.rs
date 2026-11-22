@@ -320,6 +320,23 @@ fn cid_cmp(a: u64, b: u64, files: &[Option<Buf>], longs: &Longs) -> std::cmp::Or
     }
 }
 
+/// Append-only log of long ids seen while parsing events: [key, ptr, len] (ptr into the input maps).
+type LongLog = Vec<[u64; 3]>;
+
+/// Deduplicates a log into a map.
+fn longs_from_log(mut log: LongLog) -> LongMap {
+    log.sort_unstable_by_key(|e| e[0]);
+    log.dedup_by_key(|e| e[0]);
+    let mut m = LongMap::default();
+    m.reserve(log.len());
+    for e in log {
+        let p = e[1] as *const u8;
+        let n = e[2] as usize;
+        m.insert(e[0], unsafe { std::slice::from_raw_parts(p, n) }.into());
+    }
+    m
+}
+
 /// Read-only view over every thread's long-ID map.
 struct Longs<'a>(Vec<&'a LongMap>);
 impl Longs<'_> {
@@ -1570,7 +1587,7 @@ struct EvCtx<'a> {
 }
 
 #[inline(never)]
-fn parse_events(data: &[u8], c: &EvCtx, out: &mut NtBuckets<ERec, 2>, longs: &mut LongMap) {
+fn parse_events(data: &[u8], c: &EvCtx, out: &mut NtBuckets<ERec, 2>, longs: &mut LongLog) {
     let mask = out.len() - 1;
     let mut dc = DateCache::new();
     let dend = data.as_ptr() as usize + data.len();
@@ -1598,7 +1615,15 @@ fn parse_events(data: &[u8], c: &EvCtx, out: &mut NtBuckets<ERec, 2>, longs: &mu
             } else if ty != b"view" && ty != b"cart" {
                 break 'v;
             }
-            rec.user = key_at(f[1], dend, longs);
+            rec.user = match fast_key_at(f[1], dend) {
+                Some(v) => v,
+                None => {
+                    // long id: log its location (no lookup); deduplicated after the parse phase
+                    let k = SLOW | (hash_bytes(f[1]) >> 1);
+                    longs.push([k, f[1].as_ptr() as u64, f[1].len() as u64]);
+                    k
+                }
+            };
             rec.ts = (ts - c.ws) as u32;
         }
         out.push(part_of(eid, mask), rec);
@@ -2142,7 +2167,7 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
                         5 => NtBuckets::new(1024, per / 1024 * 5 / 4 + 16),
                         _ => NtBuckets::new(1, 16),
                     };
-                    (bk, 0u64, LongMap::default())
+                    (bk, 0u64, LongLog::new())
                 },
                 |st, i| {
                     let d = chunk_data(&ev_maps, &ev_chunks[i]);
@@ -2192,10 +2217,10 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
         });
         let cap = est_events / threads / P * 5 / 4 + 16;
         let ctx = EvCtx { ws, we, ingest_base, products: &products, unknown_cat };
-        let ev_states: Vec<(NtBuckets<ERec, 2>, LongMap)> = parallel(
+        let ev_states: Vec<(NtBuckets<ERec, 2>, LongLog)> = parallel(
             threads,
             ev_chunks.len(),
-            || (NtBuckets::new(P, cap), LongMap::default()),
+            || (NtBuckets::new(P, cap), LongLog::new()),
             |st, i| timed!(A_PARSE, parse_events(chunk_data(&ev_maps, &ev_chunks[i]), &ctx, &mut st.0, &mut st.1)),
         );
         log(&t0, "events parse threads done");
@@ -2203,10 +2228,16 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
     });
     let mut long_maps: Vec<LongMap> = vec![link_longs];
     let mut ev_parts: Vec<Vec<Vec<ERec>>> = Vec::with_capacity(ev_states.len());
-    for (parts, lm) in ev_states {
+    let mut logs: Vec<LongLog> = Vec::with_capacity(ev_states.len());
+    for (parts, lg) in ev_states {
         ev_parts.push(parts.finish());
-        long_maps.push(lm);
+        logs.push(lg);
     }
+    let ev_longs: Vec<LongMap> = std::thread::scope(|sc| {
+        let hs: Vec<_> = logs.into_iter().map(|lg| sc.spawn(move || longs_from_log(lg))).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    long_maps.extend(ev_longs);
     log(&t0, &format!("events parsed ({} chunks); links: {} remapped ids", ev_chunks.len(), person_map.len()));
 
     // ---- dedup events + parse clicks, both into person buckets
