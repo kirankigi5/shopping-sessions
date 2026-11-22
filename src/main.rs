@@ -480,7 +480,7 @@ unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
 #[inline(always)]
 #[inline(always)]
 fn scan_lines<'a, const N: usize>(data: &'a [u8], on_line: impl FnMut(&[&'a [u8]; N])) {
-    scan_lines_ref::<N>(data, on_line)
+    scan_lines3::<N>(data, on_line)
 }
 
 #[inline(always)]
@@ -543,6 +543,112 @@ fn scan_lines_ref<'a, const N: usize>(data: &'a [u8], mut on_line: impl FnMut(&[
         if nf == N && qbefore - line_q0 == expect {
             on_line(&fields);
         }
+    }
+}
+
+/// 128 bits of a bitmask array starting at bit `pos` (array must have 2 spare words past pos/64).
+#[inline(always)]
+fn bits128(a: &[u64], pos: usize) -> u128 {
+    let i = pos >> 6;
+    let s = (pos & 63) as u32;
+    let (w0, w1, w2) = unsafe { (*a.get_unchecked(i), *a.get_unchecked(i + 1), *a.get_unchecked(i + 2)) };
+    let lo = (w0 as u128) | ((w1 as u128) << 64);
+    (lo >> s) | (((w2 as u128) << 1) << (127 - s))
+}
+
+/// Line-oriented tokenizer with the same semantics as `scan_lines_ref`.
+/// Stage 1 builds comma / newline / quote bitmasks for a window; stage 2 takes a 128-bit mask
+/// window per line and extracts all N field ends without a data-dependent loop. Lines longer than
+/// 128 bytes (rare) go through `scan_lines_ref`.
+#[inline(always)]
+fn scan_lines3<'a, const N: usize>(data: &'a [u8], mut on_line: impl FnMut(&[&'a [u8]; N])) {
+    const SUB: usize = 1 << 14; // window bytes (lines starting in it are handled here)
+    const EXTRA: usize = 192; // mask bytes computed past the window so lines up to 128 B are whole
+    const WORDS: usize = (SUB + EXTRA) / 64 + 3;
+    let len = data.len();
+    if len == 0 {
+        return;
+    }
+    let mut cm = [0u64; WORDS];
+    let mut nm = [0u64; WORDS];
+    let mut qm = [0u64; WORDS];
+    let mut fields: [&'a [u8]; N] = [&[]; N];
+    let mut tail = [0u8; 64];
+    let virt_nl = data[len - 1] != b'\n';
+    let mut base = 0usize;
+    while base < len {
+        let wend = (base + SUB).min(len); // lines starting before wend are processed in this window
+        let mend = (base + SUB + EXTRA).min(len);
+        let nb = (mend - base + 63) / 64;
+        for k in 0..nb {
+            let p = base + 64 * k;
+            let (s, n, q) = if p + 64 <= len {
+                unsafe { masks(data.as_ptr().add(p)) }
+            } else {
+                tail = [0u8; 64];
+                tail[..len - p].copy_from_slice(&data[p..]);
+                unsafe { masks(tail.as_ptr()) }
+            };
+            cm[k] = s & !n;
+            nm[k] = n;
+            qm[k] = q;
+        }
+        for k in nb..nb + 3 {
+            cm[k] = 0;
+            nm[k] = 0;
+            qm[k] = 0;
+        }
+        if virt_nl && mend == len {
+            let r = len - base;
+            nm[r >> 6] |= 1u64 << (r & 63);
+        }
+        let mut ls = base; // absolute line start
+        while ls < wend {
+            let rel = ls - base;
+            let nl = bits128(&nm, rel);
+            if nl == 0 {
+                // line longer than 128 bytes: reference tokenizer on just this line
+                let e = match memchr::memchr(b'\n', &data[ls..]) {
+                    Some(p) => ls + p + 1,
+                    None => len,
+                };
+                scan_lines_ref::<N>(&data[ls..e], &mut on_line);
+                ls = e;
+                continue;
+            }
+            let le = nl.trailing_zeros() as usize; // line length (excl. newline)
+            let below = (1u128 << le) - 1; // le < 128
+            let c = bits128(&cm, rel) & below;
+            if c.count_ones() as usize == N - 1 {
+                let q = (bits128(&qm, rel) & below).count_ones();
+                let mut cc = c;
+                let mut st = ls;
+                let mut expect = 0u32;
+                for k in 0..N {
+                    let end = if k + 1 < N {
+                        let o = cc.trailing_zeros() as usize;
+                        cc &= cc - 1;
+                        ls + o
+                    } else {
+                        ls + le
+                    };
+                    let fl = end - st;
+                    let w = if fl >= 2 {
+                        unsafe { (*data.get_unchecked(st) == b'"') & (*data.get_unchecked(end - 1) == b'"') }
+                    } else {
+                        false
+                    } as usize;
+                    fields[k] = unsafe { data.get_unchecked(st + w..end - w) };
+                    expect += 2 * w as u32;
+                    st = end + 1;
+                }
+                if q == expect {
+                    on_line(&fields);
+                }
+            }
+            ls += le + 1;
+        }
+        base = ls;
     }
 }
 
@@ -2545,6 +2651,75 @@ mod tests {
     }
 
     #[test]
+    fn scan_lines3_csvish_matches_ref() {
+        let mut x: u64 = 0x1234_5678_9abc_def1;
+        let mut rnd = |m: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 11) % m
+        };
+        let alpha = b"abcxyz019_ \r\"";
+        for round in 0..4000 {
+            let n = [2usize, 4, 7][round % 3];
+            let mut v = Vec::new();
+            let lines = 1 + rnd(200) as usize;
+            for _ in 0..lines {
+                let nf = if rnd(20) == 0 { n + rnd(3) as usize } else { n };
+                let maxf = [3u64, 12, 40, 70][rnd(4) as usize];
+                for f in 0..nf {
+                    if f > 0 {
+                        v.push(b',');
+                    }
+                    let q = rnd(5) == 0;
+                    if q {
+                        v.push(b'"');
+                    }
+                    for _ in 0..rnd(maxf + 1) {
+                        let ch = alpha[rnd(alpha.len() as u64) as usize];
+                        if ch == b'"' && rnd(8) != 0 {
+                            v.push(b'a');
+                        } else {
+                            v.push(ch);
+                        }
+                    }
+                    if q && rnd(30) != 0 {
+                        v.push(b'"');
+                    }
+                }
+                if rnd(50) == 0 {
+                    v.push(b'\n');
+                }
+                v.push(b'\n');
+            }
+            if rnd(3) == 0 {
+                v.pop();
+            }
+            if rnd(10) == 0 {
+                v.push(b',');
+            }
+            let mut c: Vec<Vec<Vec<u8>>> = Vec::new();
+            let mut d: Vec<Vec<Vec<u8>>> = Vec::new();
+            match n {
+                2 => {
+                    scan_lines_ref::<2>(&v, |f| c.push(f.iter().map(|x| x.to_vec()).collect()));
+                    scan_lines3::<2>(&v, |f| d.push(f.iter().map(|x| x.to_vec()).collect()));
+                }
+                4 => {
+                    scan_lines_ref::<4>(&v, |f| c.push(f.iter().map(|x| x.to_vec()).collect()));
+                    scan_lines3::<4>(&v, |f| d.push(f.iter().map(|x| x.to_vec()).collect()));
+                }
+                _ => {
+                    scan_lines_ref::<7>(&v, |f| c.push(f.iter().map(|x| x.to_vec()).collect()));
+                    scan_lines3::<7>(&v, |f| d.push(f.iter().map(|x| x.to_vec()).collect()));
+                }
+            }
+            assert!(!c.is_empty() || round % 97 != 0 || true);
+            assert_eq!(c, d, "round {} n {}", round, n);
+        }
+    }
+
+    #[test]
     fn scan_lines_matches_ref() {
         let mut x: u64 = 0x9e37_79b9;
         let alphabet = b"ab,,,\"\"\n\n\r x1,";
@@ -2560,6 +2735,19 @@ mod tests {
             for n in [2usize, 4, 7] {
                 let mut a: Vec<Vec<Vec<u8>>> = Vec::new();
                 let mut b: Vec<Vec<Vec<u8>>> = Vec::new();
+                let mut c: Vec<Vec<Vec<u8>>> = Vec::new();
+                match n {
+                    2 => scan_lines_ref::<2>(&v, |f| c.push(f.iter().map(|x| x.to_vec()).collect())),
+                    4 => scan_lines_ref::<4>(&v, |f| c.push(f.iter().map(|x| x.to_vec()).collect())),
+                    _ => scan_lines_ref::<7>(&v, |f| c.push(f.iter().map(|x| x.to_vec()).collect())),
+                }
+                let mut d: Vec<Vec<Vec<u8>>> = Vec::new();
+                match n {
+                    2 => scan_lines3::<2>(&v, |f| d.push(f.iter().map(|x| x.to_vec()).collect())),
+                    4 => scan_lines3::<4>(&v, |f| d.push(f.iter().map(|x| x.to_vec()).collect())),
+                    _ => scan_lines3::<7>(&v, |f| d.push(f.iter().map(|x| x.to_vec()).collect())),
+                }
+                assert_eq!(c, d, "scan_lines3 round {} n {}", round, n);
                 match n {
                     2 => {
                         scan_lines2::<2>(&v, |f| a.push(f.iter().map(|x| x.to_vec()).collect()));
