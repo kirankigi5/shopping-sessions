@@ -1551,11 +1551,12 @@ fn main() {
             eprintln!("generate 20M: {:?} in {:.2}s", st, t.elapsed().as_secs_f64());
             let big_out = scratch.join("out20");
             let big = [
-                Cfg { threads, read: false, p: 1024, q: 1024, dense: false },
-                Cfg { threads, read: false, p: 1024, q: 1024, dense: false },
-                Cfg { threads, read: false, p: 1024, q: 1024, dense: false },
-                Cfg { threads, read: false, p: 256, q: 1024, dense: false },
-                Cfg { threads: 1, read: false, p: 1024, q: 1024, dense: false },
+                Cfg { threads, read: false, p: 1024, q: 1024, dense: false }, // baseline
+                Cfg { threads, read: false, p: 4096, q: 1024, dense: false }, // smaller dedup tables (L2 fit)
+                Cfg { threads, read: false, p: 1024, q: 4096, dense: false }, // smaller session tables
+                Cfg { threads, read: false, p: 4096, q: 4096, dense: false }, // both small
+                Cfg { threads, read: false, p: 4096, q: 4096, dense: true },  // both small + dense dedup
+                Cfg { threads: 1, read: false, p: 1024, q: 1024, dense: false }, // single-thread CPU work
             ];
             for c in &big {
                 let _ = std::fs::remove_dir_all(&big_out);
@@ -1564,7 +1565,7 @@ fn main() {
                 pipeline(c, &gen_dir, &big_out);
                 let (u1, s1) = cpu_times();
                 let line = std::mem::take(&mut *LOGBUF.lock().unwrap());
-                eprintln!("B t{} p{} cpu{:.2}/{:.2} {}{}", c.threads, c.p, u1 - u0, s1 - s0, line, acc_report());
+                eprintln!("B t{} p{} q{} d{} cpu{:.2}/{:.2} {}{}", c.threads, c.p, c.q, c.dense as u8, u1 - u0, s1 - s0, line, acc_report());
             }
             unsafe { std::env::set_var("BENCH_PARSE", "1") };
             for th in [1usize, 8] {
