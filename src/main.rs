@@ -1699,6 +1699,11 @@ fn main() {
             eprintln!("cfg t={} read={} p={}:{}", c.threads, c.read as u8, c.p, line);
         }
         let _ = diag::bench_parse;
+        {
+            let rd = |p: &str| std::fs::read_to_string(p).unwrap_or_default();
+            let pick = |t: String, k: &str| t.lines().filter(|l| l.starts_with(k)).map(|l| l.split_whitespace().collect::<Vec<_>>().join(" ")).collect::<Vec<_>>().join(";");
+            eprintln!("THP={} defrag={} | self {} {} | sys {}", rd("/sys/kernel/mm/transparent_hugepage/enabled").trim(), rd("/sys/kernel/mm/transparent_hugepage/defrag").trim(), pick(rd("/proc/self/smaps_rollup"), "AnonHugePages"), pick(rd("/proc/self/smaps_rollup"), "Rss"), pick(rd("/proc/meminfo"), "AnonHugePages"));
+        }
         eprintln!("DIAG build: exiting 1 on purpose to get logs");
         std::process::exit(1);
     }
@@ -1773,7 +1778,7 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
         let lines: usize = (0..n).map(|i| memchr::memchr_iter(b'\n', chunk_data(&ev_maps, &ev_chunks[i])).count()).sum();
         let ctx = EvCtx { ws, we, ingest_base, products: &products, unknown_cat };
         let mut line = format!("PB t{}", bt);
-        for variant in 0..6usize {
+        for variant in 0..7usize {
             let per = lines / bt + 1024;
             let t = Instant::now();
             let states = parallel(
@@ -1805,6 +1810,7 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
                             let b = parse_ts_c(f[3], &mut dc).unwrap_or(0) as u64;
                             *sink = sink.wrapping_add(eq_key_at(f[0], dend) ^ eq_key_at(f[1], dend).rotate_left(9) ^ a ^ b.rotate_left(7));
                         }),
+                        6 => scan_lines_ref::<7>(d, |f| *sink = sink.wrapping_add(f[0].len() as u64 ^ f[6].len() as u64)),
                         _ => parse_events(d, &ctx, &mut st.0, &mut st.2),
                     }
                 },
@@ -1816,7 +1822,7 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
             drop(states);
             line.push_str(&format!(" v{}={:.1}", variant, el * 1e9 * bt as f64 / lines as f64));
         }
-        eprintln!("{} ns/line/thread: tok,+ts,+keys,+ts+keys,full-1vec,full-1024", line);
+        eprintln!("{} ns/line/thread: tok3,+ts,+keys,+ts+keys,full-1vec,full-1024,tokref", line);
         return;
     }
 
