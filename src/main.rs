@@ -480,7 +480,7 @@ unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
 #[inline(always)]
 #[inline(always)]
 fn scan_lines<'a, const N: usize>(data: &'a [u8], on_line: impl FnMut(&[&'a [u8]; N])) {
-    scan_lines_ref::<N>(data, on_line)
+    scan_lines4::<N>(data, on_line)
 }
 
 #[inline(always)]
@@ -649,6 +649,137 @@ fn scan_lines3<'a, const N: usize>(data: &'a [u8], mut on_line: impl FnMut(&[&'a
             ls += le + 1;
         }
         base = ls;
+    }
+}
+
+/// simdjson-style tokenizer with the same semantics as `scan_lines_ref`. Stage 1 flattens every
+/// separator of a window into `pos` (offset << 1 | is_newline) with branch-free unrolled writes and
+/// keeps per-block quote masks; stage 2 walks lines with one predictable check per line.
+#[inline(always)]
+fn scan_lines4<'a, const N: usize>(data: &'a [u8], mut on_line: impl FnMut(&[&'a [u8]; N])) {
+    const SUB: usize = 1 << 15; // window bytes
+    const NB: usize = SUB / 64 + 1;
+    let len = data.len();
+    if len == 0 {
+        return;
+    }
+    let mut pos: Vec<u32> = vec![0; SUB + 64];
+    let mut qm = [0u64; NB + 1];
+    let mut qpre = [0u32; NB + 1];
+    let mut fields: [&'a [u8]; N] = [&[]; N];
+    let mut tail = [0u8; 64];
+    let mut base = 0usize; // window start = start of the first unprocessed line
+    while base < len {
+        let wend = (base + SUB).min(len);
+        // ---- stage 1
+        let mut np = 0usize;
+        let mut nb = 0usize;
+        let mut qacc = 0u32;
+        let mut b = base;
+        while b < wend {
+            let (sep0, nl, q) = if b + 64 <= len {
+                unsafe { masks(data.as_ptr().add(b)) }
+            } else {
+                tail = [0u8; 64];
+                tail[..len - b].copy_from_slice(&data[b..]);
+                unsafe { masks(tail.as_ptr()) }
+            };
+            // only separators inside the window
+            let lim = wend - b;
+            let keep = if lim >= 64 { u64::MAX } else { (1u64 << lim) - 1 };
+            let mut sep = sep0 & keep;
+            qm[nb] = q & keep;
+            qpre[nb] = qacc;
+            qacc += (q & keep).count_ones();
+            let cnt = sep.count_ones() as usize;
+            let rel = (b - base) as u32;
+            let mut w = np;
+            while sep != 0 {
+                for _ in 0..8 {
+                    let off = sep.trailing_zeros(); // 64 when sep == 0: the write is junk, overwritten later
+                    let o = off & 63;
+                    unsafe { *pos.get_unchecked_mut(w) = ((rel + o) << 1) | ((nl >> o) & 1) as u32 };
+                    w += 1;
+                    sep &= sep.wrapping_sub(1);
+                }
+            }
+            np += cnt;
+            nb += 1;
+            b += 64;
+        }
+        let at_end = wend == len;
+        if at_end && data[len - 1] != b'\n' {
+            pos[np] = (((len - base) as u32) << 1) | 1; // virtual newline
+            np += 1;
+        }
+        qpre[nb] = qacc;
+        let qcount = |p: usize| -> u32 {
+            // quotes in [base, base + p)
+            let k = p >> 6;
+            unsafe { *qpre.get_unchecked(k) + (*qm.get_unchecked(k) & ((1u64 << (p & 63)) - 1)).count_ones() }
+        };
+        // ---- stage 2
+        let mut i = 0usize;
+        let mut ls = 0usize; // line start (relative)
+        let mut done_to = 0usize; // relative end of the last complete line
+        while i < np {
+            if i + N <= np {
+                let mut commas = 0u32;
+                for k in 0..N - 1 {
+                    commas |= unsafe { *pos.get_unchecked(i + k) } & 1;
+                }
+                let last = unsafe { *pos.get_unchecked(i + N - 1) };
+                if commas == 0 && last & 1 == 1 {
+                    let mut st = ls;
+                    let mut expect = 0u32;
+                    for k in 0..N {
+                        let end = (unsafe { *pos.get_unchecked(i + k) } >> 1) as usize;
+                        let (a, e) = (base + st, base + end);
+                        let w = if e - a >= 2 {
+                            unsafe { (*data.get_unchecked(a) == b'"') & (*data.get_unchecked(e - 1) == b'"') }
+                        } else {
+                            false
+                        } as usize;
+                        fields[k] = unsafe { data.get_unchecked(a + w..e - w) };
+                        expect += 2 * w as u32;
+                        st = end + 1;
+                    }
+                    let le = (last >> 1) as usize;
+                    if qcount(le) - qcount(ls) == expect {
+                        on_line(&fields);
+                    }
+                    ls = le + 1;
+                    done_to = ls;
+                    i += N;
+                    continue;
+                }
+            }
+            // slow path: skip to this line's newline (malformed), or stop if it is not in the window
+            let mut j = i;
+            while j < np && unsafe { *pos.get_unchecked(j) } & 1 == 0 {
+                j += 1;
+            }
+            if j == np {
+                break;
+            }
+            ls = (pos[j] >> 1) as usize + 1;
+            done_to = ls;
+            i = j + 1;
+        }
+        if at_end {
+            break;
+        }
+        if done_to == 0 {
+            // a single line longer than the window: hand it to the reference tokenizer
+            let e = match memchr::memchr(b'\n', &data[base..]) {
+                Some(p) => base + p + 1,
+                None => len,
+            };
+            scan_lines_ref::<N>(&data[base..e], &mut on_line);
+            base = e;
+        } else {
+            base += done_to;
+        }
     }
 }
 
@@ -2943,8 +3074,31 @@ mod tests {
                     scan_lines3::<7>(&v, |f| d.push(f.iter().map(|x| x.to_vec()).collect()));
                 }
             }
-            assert!(!c.is_empty() || round % 97 != 0 || true);
             assert_eq!(c, d, "round {} n {}", round, n);
+            let mut e: Vec<Vec<Vec<u8>>> = Vec::new();
+            match n {
+                2 => scan_lines4::<2>(&v, |f| e.push(f.iter().map(|x| x.to_vec()).collect())),
+                4 => scan_lines4::<4>(&v, |f| e.push(f.iter().map(|x| x.to_vec()).collect())),
+                _ => scan_lines4::<7>(&v, |f| e.push(f.iter().map(|x| x.to_vec()).collect())),
+            }
+            assert_eq!(c, e, "scan_lines4 round {} n {}", round, n);
+        }
+    }
+
+    #[test]
+    fn scan_lines4_long_lines() {
+        for len in [40_000usize, 70_000, 32_767, 32_768, 32_769, 100_000] {
+            let mut v: Vec<u8> = b"a,b\nc,d\n".to_vec();
+            v.extend(std::iter::repeat(b'x').take(len));
+            v.extend_from_slice(b",y\ne,\"f\"\n");
+            v.extend(std::iter::repeat(b'z').take(len / 3));
+            v.extend_from_slice(b",w");
+            let mut c: Vec<Vec<Vec<u8>>> = Vec::new();
+            let mut e: Vec<Vec<Vec<u8>>> = Vec::new();
+            scan_lines_ref::<2>(&v, |f| c.push(f.iter().map(|x| x.to_vec()).collect()));
+            scan_lines4::<2>(&v, |f| e.push(f.iter().map(|x| x.to_vec()).collect()));
+            assert_eq!(c.len(), 5);
+            assert_eq!(c, e, "len {}", len);
         }
     }
 
@@ -2977,6 +3131,13 @@ mod tests {
                     _ => scan_lines3::<7>(&v, |f| d.push(f.iter().map(|x| x.to_vec()).collect())),
                 }
                 assert_eq!(c, d, "scan_lines3 round {} n {}", round, n);
+                let mut e: Vec<Vec<Vec<u8>>> = Vec::new();
+                match n {
+                    2 => scan_lines4::<2>(&v, |f| e.push(f.iter().map(|x| x.to_vec()).collect())),
+                    4 => scan_lines4::<4>(&v, |f| e.push(f.iter().map(|x| x.to_vec()).collect())),
+                    _ => scan_lines4::<7>(&v, |f| e.push(f.iter().map(|x| x.to_vec()).collect())),
+                }
+                assert_eq!(c, e, "scan_lines4 round {} n {}", round, n);
                 match n {
                     2 => {
                         scan_lines2::<2>(&v, |f| a.push(f.iter().map(|x| x.to_vec()).collect()));
