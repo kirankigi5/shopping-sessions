@@ -1608,7 +1608,7 @@ struct EvCtx<'a> {
 }
 
 #[inline(never)]
-fn parse_events(data: &[u8], c: &EvCtx, out: &mut NtBuckets<ERec, 4>, longs: &mut LongLog) {
+fn parse_events(data: &[u8], c: &EvCtx, out: &mut NtBuckets<ERec, 8>, longs: &mut LongLog) {
     let mask = out.len() - 1;
     let mut dc = DateCache::new();
     let dend = data.as_ptr() as usize + data.len();
@@ -1805,12 +1805,12 @@ fn dedup_insert(ev_parts: &[Vec<Vec<ERec>>], b: usize, table: &mut Vec<Slot>, de
 
 /// Emits surviving (winning, valid) events in record order, mapped to persons and scattered.
 #[inline(never)]
-fn dedup_emit(ev_parts: &[Vec<Vec<ERec>>], b: usize, dead: &[bool], pm: &PersonMap, out: &mut NtBuckets<SRec, 8>) {
+fn dedup_emit(ev_parts: &[Vec<Vec<ERec>>], b: usize, dead: &[bool], pm: &PersonMap, out: &mut NtBuckets<SRec, 16>) {
     let qm = out.len() - 1;
     const BATCH: usize = 32;
     let mut buf: [(u64, u32, u32); BATCH] = [(0, 0, 0); BATCH];
     let mut n = 0usize;
-    let flush = |buf: &[(u64, u32, u32)], out: &mut NtBuckets<SRec, 8>| {
+    let flush = |buf: &[(u64, u32, u32)], out: &mut NtBuckets<SRec, 16>| {
         let mut ks = [0u64; BATCH];
         for (k, b) in ks.iter_mut().zip(buf) {
             *k = b.0;
@@ -2186,7 +2186,7 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
                 bt,
                 n,
                 || {
-                    let bk: NtBuckets<ERec, 4> = match variant {
+                    let bk: NtBuckets<ERec, 8> = match variant {
                         4 => NtBuckets::new(1, per),
                         5 => NtBuckets::new(1024, per / 1024 * 5 / 4 + 16),
                         _ => NtBuckets::new(1, 16),
@@ -2241,7 +2241,7 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
         });
         let cap = est_events / threads / P * 5 / 4 + 16;
         let ctx = EvCtx { ws, we, ingest_base, products: &products, unknown_cat };
-        let ev_states: Vec<(NtBuckets<ERec, 4>, LongLog)> = parallel(
+        let ev_states: Vec<(NtBuckets<ERec, 8>, LongLog)> = parallel(
             threads,
             ev_chunks.len(),
             || (NtBuckets::new(P, cap), LongLog::new()),
@@ -2266,7 +2266,7 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
 
     // ---- dedup events + parse clicks, both into person buckets
     struct Mid {
-        evb: Option<NtBuckets<SRec, 8>>,
+        evb: Option<NtBuckets<SRec, 16>>,
         ev: Vec<Vec<SRec>>,
         ck: Vec<Vec<CRec>>,
         table: Vec<Slot>,
