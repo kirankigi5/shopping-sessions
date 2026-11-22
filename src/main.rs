@@ -11,6 +11,9 @@ use std::time::Instant;
 
 use memmap2::Mmap;
 
+#[cfg(feature = "diag")]
+mod diag;
+
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -687,6 +690,8 @@ fn main() {
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4))
         .clamp(1, 64);
 
+    #[cfg(feature = "diag")]
+    diag::run(&data_dir);
     let manifest = std::fs::read_to_string(data_dir.join("manifest.json")).expect("manifest");
     let ws = manifest_ts(&manifest, "window_start");
     let we = manifest_ts(&manifest, "window_end");
@@ -944,6 +949,11 @@ fn main() {
         sc.spawn(move || write_campaign_daily(&path, camp, ndays, day0, camp_ids, camp_channels));
     });
     log(&t0, "done");
+    #[cfg(feature = "diag")]
+    {
+        eprintln!("DIAG build: exiting 1 on purpose to get logs");
+        std::process::exit(1);
+    }
 }
 
 struct St {
