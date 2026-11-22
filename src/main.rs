@@ -2351,7 +2351,7 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
                         k += 1;
                         let at = cur[l] as usize;
                         cur[l] += 1;
-                        unsafe { *evs.get_unchecked_mut(at) = *e };
+                        unsafe { *evs.get_unchecked_mut(at) = ((e.ts as u64) << 32) | e.pc as u64 };
                     }
                 }
             }
@@ -2407,7 +2407,7 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
             for l in 0..np {
                 let es = &mut evs[st.loff[l] as usize..st.loff[l + 1] as usize];
                 if es.len() > 1 {
-                    sort_srec_by_ts(es, &mut st.radix_tmp);
+                    sort_ev(es, &mut st.radix_tmp);
                 }
                 let cs_ = &mut cks[coff[l] as usize..coff[l + 1] as usize];
                 if cs_.len() > 1 {
@@ -2465,14 +2465,14 @@ struct St {
     pos: Vec<u32>,
     cat_sum: Vec<u64>,
     cat_touched: Vec<u16>,
-    evs: Vec<SRec>,
+    evs: Vec<u64>, // one person's events: ts << 32 | pc
     cks: Vec<CRec>,
     lslots: Vec<(u64, u32)>,
     lkeys: Vec<u64>,
     lcount: Vec<u32>,
     lids: Vec<u32>,
     loff: Vec<u32>,
-    radix_tmp: Vec<SRec>,
+    radix_tmp: Vec<u64>,
     radix_ctmp: Vec<CRec>,
 }
 
@@ -2513,6 +2513,16 @@ fn radix_sort_by<T: Copy>(v: &mut [T], tmp: &mut Vec<T>, key: impl Fn(&T) -> u32
     }
 }
 
+/// Sorts packed events (ts << 32 | pc); the order among equal ts does not matter.
+fn sort_ev(v: &mut [u64], tmp: &mut Vec<u64>) {
+    if v.len() >= RADIX_MIN {
+        radix_sort_by(v, tmp, |k| (*k >> 32) as u32);
+    } else {
+        v.sort_unstable();
+    }
+}
+
+#[allow(dead_code)]
 fn sort_srec_by_ts(v: &mut [SRec], tmp: &mut Vec<SRec>) {
     if v.len() >= RADIX_MIN {
         radix_sort_by(v, tmp, |e| e.ts);
@@ -2559,7 +2569,7 @@ fn flush_day(st: &mut St, person: u64, day: i32, sessions: u32, events: u32, rev
 
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-fn process_person(st: &mut St, person: u64, evs: &[SRec], pc: &[CRec], ws: i64, day0: i64, ndays: usize, organic: u32) {
+fn process_person(st: &mut St, person: u64, evs: &[u64], pc: &[CRec], ws: i64, day0: i64, ndays: usize, organic: u32) {
     let week = 7 * DAY_MS;
     let mut lo = 0usize; // first click with ts >= start - 7d
     let mut hi = 0usize; // first click with ts > start
@@ -2568,7 +2578,7 @@ fn process_person(st: &mut St, person: u64, evs: &[SRec], pc: &[CRec], ws: i64, 
     let n = evs.len();
     let mut k = 0usize;
     while k < n {
-        let start = evs[k].ts as i64;
+        let start = (evs[k] >> 32) as i64;
         let day = (ws + start).div_euclid(DAY_MS) as i32;
         if day != cur_day {
             if cur_day != i32::MIN {
@@ -2579,18 +2589,19 @@ fn process_person(st: &mut St, person: u64, evs: &[SRec], pc: &[CRec], ws: i64, 
             u_ev = 0;
             u_rev = 0;
         }
-        let mut last = evs[k].ts;
+        let mut last = (evs[k] >> 32) as u32;
         let mut m = k;
         let mut rev = 0i64;
         let mut purch = false;
-        while m < n && evs[m].ts - last <= 1_800_000 {
-            let e = &evs[m];
-            last = e.ts;
-            if e.pc != 0 {
+        while m < n && ((evs[m] >> 32) as u32) - last <= 1_800_000 {
+            let e = evs[m];
+            last = (e >> 32) as u32;
+            let epc = e as u32;
+            if epc != 0 {
                 purch = true;
-                let price = (e.pc >> 8) as i64;
+                let price = (epc >> 8) as i64;
                 rev += price;
-                let c = (e.pc & 0xFF) as usize;
+                let c = (epc & 0xFF) as usize;
                 if st.cat_sum[c] == 0 {
                     st.cat_touched.push(c as u16);
                 }
