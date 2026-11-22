@@ -158,10 +158,97 @@ fn fast_key(s: &[u8]) -> Option<u64> {
     None
 }
 
-/// fast_key using the windowed encoder when 10 bytes from the field start lie before `end`.
+static IDX16: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+
+/// Same result as `fast_key`, using one 16-byte vector load. Caller guarantees 16 readable bytes.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+#[inline(always)]
+unsafe fn simd_key16(s: &[u8]) -> Option<u64> {
+    use std::arch::x86_64::*;
+    let n = s.len();
+    if n.wrapping_sub(1) >= KEY_LEN {
+        return None;
+    }
+    unsafe {
+        let v = _mm_loadu_si128(s.as_ptr() as *const __m128i);
+        let d = _mm_sub_epi8(v, _mm_set1_epi8(0x30));
+        let is_digit = _mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d);
+        let l = _mm_sub_epi8(v, _mm_set1_epi8(0x61));
+        let is_lower = _mm_cmpeq_epi8(_mm_min_epu8(l, _mm_set1_epi8(25)), l);
+        let is_us = _mm_cmpeq_epi8(v, _mm_set1_epi8(0x5F));
+        let valid = _mm_or_si128(_mm_or_si128(is_digit, is_lower), is_us);
+        let idx = _mm_loadu_si128(IDX16.as_ptr() as *const __m128i);
+        let inlen = _mm_cmpgt_epi8(_mm_set1_epi8(n as i8), idx);
+        if _mm_movemask_epi8(_mm_andnot_si128(valid, inlen)) != 0 {
+            return None;
+        }
+        let code = _mm_or_si128(
+            _mm_or_si128(
+                _mm_and_si128(is_digit, _mm_add_epi8(d, _mm_set1_epi8(1))),
+                _mm_and_si128(is_lower, _mm_add_epi8(l, _mm_set1_epi8(12))),
+            ),
+            _mm_and_si128(is_us, _mm_set1_epi8(11)),
+        );
+        let code = _mm_and_si128(code, inlen);
+        // pairs -> 12-bit lanes (c0*64+c1), then -> 24-bit lanes (4 chars each)
+        let w = _mm_maddubs_epi16(code, _mm_set1_epi16(0x0140));
+        let x = _mm_madd_epi16(w, _mm_set1_epi32(0x0001_1000));
+        let lo = _mm_cvtsi128_si64(x) as u64;
+        let x2 = _mm_extract_epi32::<2>(x) as u32 as u64;
+        Some(((lo & 0xFFFF_FFFF) << 36) | ((lo >> 32) << 12) | (x2 >> 12))
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn simd_key16(s: &[u8]) -> Option<u64> {
+    use std::arch::aarch64::*;
+    let n = s.len();
+    if n.wrapping_sub(1) >= KEY_LEN {
+        return None;
+    }
+    unsafe {
+        let v = vld1q_u8(s.as_ptr());
+        let d = vsubq_u8(v, vdupq_n_u8(0x30));
+        let is_digit = vcleq_u8(d, vdupq_n_u8(9));
+        let l = vsubq_u8(v, vdupq_n_u8(0x61));
+        let is_lower = vcleq_u8(l, vdupq_n_u8(25));
+        let is_us = vceqq_u8(v, vdupq_n_u8(0x5F));
+        let valid = vorrq_u8(vorrq_u8(is_digit, is_lower), is_us);
+        let inlen = vcltq_u8(vld1q_u8(IDX16.as_ptr()), vdupq_n_u8(n as u8));
+        if vmaxvq_u8(vbicq_u8(inlen, valid)) != 0 {
+            return None;
+        }
+        let code = vorrq_u8(
+            vorrq_u8(vandq_u8(is_digit, vaddq_u8(d, vdupq_n_u8(1))), vandq_u8(is_lower, vaddq_u8(l, vdupq_n_u8(12)))),
+            vandq_u8(is_us, vdupq_n_u8(11)),
+        );
+        let code = vreinterpretq_u64_u8(vandq_u8(code, inlen));
+        let w0 = vgetq_lane_u64(code, 0);
+        let w1 = vgetq_lane_u64(code, 1);
+        let t = ((w0 & 0x00FF_00FF_00FF_00FF) << 6) | ((w0 >> 8) & 0x00FF_00FF_00FF_00FF);
+        let t2 = ((t & 0x0000_FFFF_0000_FFFF) << 12) | ((t >> 16) & 0x0000_FFFF_0000_FFFF);
+        let t3 = ((t2 & 0xFFFF_FFFF) << 24) | (t2 >> 32);
+        Some((t3 << 12) | ((w1 & 0xFF) << 6) | ((w1 >> 8) & 0xFF))
+    }
+}
+
+#[cfg(not(any(all(target_arch = "x86_64", target_feature = "sse4.1"), target_arch = "aarch64")))]
+#[inline(always)]
+unsafe fn simd_key16(s: &[u8]) -> Option<u64> {
+    unsafe { fast_key_win(s) }
+}
+
 #[inline(always)]
 fn fast_key_at(s: &[u8], end: usize) -> Option<u64> {
-    if s.as_ptr() as usize + KEY_LEN <= end { unsafe { fast_key_win(s) } } else { fast_key(s) }
+    let p = s.as_ptr() as usize;
+    if p + 16 <= end {
+        unsafe { simd_key16(s) }
+    } else if p + KEY_LEN <= end {
+        unsafe { fast_key_win(s) }
+    } else {
+        fast_key(s)
+    }
 }
 
 #[inline(always)]
@@ -731,20 +818,27 @@ fn date_ms_slow(f: &[u8]) -> i64 {
 
 #[inline(always)]
 fn civil_ms_c(f: &[u8], dc: &mut DateCache) -> Option<i64> {
-    if f[4] != b'-' || f[7] != b'-' || f[10] != b'T' || f[13] != b':' || f[16] != b':' {
+    // f.len() >= 20 (F1 or F2). Separators f[4]='-', f[7]='-', f[10]='T' in one word.
+    let sep = u64::from_le_bytes(f[4..12].try_into().unwrap());
+    if sep & 0x00FF_0000_FF00_00FF != 0x0054_0000_2D00_002D {
         return None;
     }
-    let h = d2(f, 11)?;
-    let mi = d2(f, 14)?;
-    let s = d2(f, 17)?;
-    if h > 23 || mi > 59 || s > 59 {
+    // "HH:MM:SS" at 11..19: digits must be 0..=9 and ':' must match, checked per byte without branches
+    let x = u64::from_le_bytes(f[11..19].try_into().unwrap()) ^ 0x3030_3A30_303A_3030;
+    if (x | x.wrapping_add(0x7676_7F76_767F_7676)) & 0x8080_8080_8080_8080 != 0 {
+        return None;
+    }
+    let h = (x & 0xFF) * 10 + ((x >> 8) & 0xFF);
+    let mi = ((x >> 24) & 0xFF) * 10 + ((x >> 32) & 0xFF);
+    let sec = ((x >> 48) & 0xFF) * 10 + (x >> 56);
+    if h > 23 || mi > 59 || sec > 59 {
         return None;
     }
     let day = dc.day_ms(f);
     if day == BAD_DATE {
         return None;
     }
-    Some(day + (h * 3600 + mi * 60 + s) * 1000)
+    Some(day + ((h * 3600 + mi * 60 + sec) * 1000) as i64)
 }
 
 /// parse_ts with a date cache.
@@ -941,6 +1035,37 @@ fn parallel<S: Send>(threads: usize, tasks: usize, init: impl Fn() -> S + Sync, 
                         }
                         work(&mut st, i);
                     }
+                    st
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    })
+}
+
+/// Like `parallel`, but runs `fin(state, worker_index)` on each worker after it runs out of tasks.
+fn parallel_fin<S: Send>(
+    threads: usize,
+    tasks: usize,
+    init: impl Fn() -> S + Sync,
+    work: impl Fn(&mut S, usize) + Sync,
+    fin: impl Fn(&mut S, usize) + Sync,
+) -> Vec<S> {
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..threads)
+            .map(|wi| {
+                let (next, init, work, fin) = (&next, &init, &work, &fin);
+                sc.spawn(move || {
+                    let mut st = init();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= tasks {
+                            break;
+                        }
+                        work(&mut st, i);
+                    }
+                    fin(&mut st, wi);
                     st
                 })
             })
@@ -1181,12 +1306,16 @@ impl PersonMap {
     }
 }
 
+static DEDUP_DENSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Marks every copy except the one with the smallest ingest_ts (per event_id) as dead.
 /// Records of bucket `b` are numbered across worker vectors in order.
 #[inline(never)]
 fn dedup_insert(ev_parts: &[Vec<Vec<ERec>>], b: usize, table: &mut Vec<Slot>, dead: &mut Vec<bool>) {
     let n: usize = ev_parts.iter().map(|t| t[b].len()).sum();
-    let cap = (n * 2).next_power_of_two().max(64);
+    // dense: 1.5n rounded up (load 0.33-0.67), else 2n (load 0.25-0.5)
+    let want = if DEDUP_DENSE.load(Ordering::Relaxed) { n + n / 2 } else { n * 2 };
+    let cap = want.next_power_of_two().max(64);
     let mask = cap - 1;
     table.clear();
     table.resize(cap, Slot { eid: 0, ingest: 0, idx: u32::MAX });
@@ -1325,12 +1454,14 @@ fn build_person_map(maps: &[Option<Buf>], chunks: &[Chunk]) -> (PersonMap, LongM
     let total: usize = chunks.iter().map(|c| c.end - c.start).sum();
     ids.reserve(total / 12);
     for c in chunks {
-        scan_lines::<2>(chunk_data(maps, c), |f| {
+        let d = chunk_data(maps, c);
+        let dend = d.as_ptr() as usize + d.len();
+        scan_lines::<2>(d, |f| {
             if f[0].is_empty() || f[1].is_empty() {
                 return;
             }
-            let a = key(f[0], &mut longs);
-            let b = key(f[1], &mut longs);
+            let a = key_at(f[0], dend, &mut longs);
+            let b = key_at(f[1], dend, &mut longs);
             if a == b {
                 return;
             }
@@ -1382,6 +1513,7 @@ struct Cfg {
     read: bool,
     p: usize,
     q: usize,
+    dense: bool,
 }
 
 fn env_usize(k: &str, d: usize) -> usize {
@@ -1401,6 +1533,7 @@ fn main() {
         read: env_usize("SS_READ", 0) == 1,
         p: env_usize("SS_P", 1024).next_power_of_two(),
         q: env_usize("SS_Q", 1024).next_power_of_two(),
+        dense: env_usize("SS_DENSE", 0) == 1,
     };
     #[cfg(feature = "diag")]
     {
@@ -1418,11 +1551,11 @@ fn main() {
             eprintln!("generate 20M: {:?} in {:.2}s", st, t.elapsed().as_secs_f64());
             let big_out = scratch.join("out20");
             let big = [
-                Cfg { threads, read: false, p: 1024, q: 1024 },
-                Cfg { threads, read: false, p: 1024, q: 1024 },
-                Cfg { threads, read: false, p: 1024, q: 1024 },
-                Cfg { threads, read: false, p: 256, q: 1024 },
-                Cfg { threads: 1, read: false, p: 1024, q: 1024 },
+                Cfg { threads, read: false, p: 1024, q: 1024, dense: false },
+                Cfg { threads, read: false, p: 1024, q: 1024, dense: false },
+                Cfg { threads, read: false, p: 1024, q: 1024, dense: false },
+                Cfg { threads, read: false, p: 256, q: 1024, dense: false },
+                Cfg { threads: 1, read: false, p: 1024, q: 1024, dense: false },
             ];
             for c in &big {
                 let _ = std::fs::remove_dir_all(&big_out);
@@ -1443,15 +1576,15 @@ fn main() {
         }
         let configs: [Cfg; 0] = [];
         let _unused = [
-            Cfg { threads, read: false, p: 1024, q: 1024 },
-            Cfg { threads, read: true, p: 1024, q: 1024 },
-            Cfg { threads, read: true, p: 256, q: 256 },
-            Cfg { threads, read: true, p: 64, q: 64 },
-            Cfg { threads, read: false, p: 64, q: 64 },
-            Cfg { threads: 4, read: true, p: 1024, q: 1024 },
-            Cfg { threads: 1, read: true, p: 1024, q: 1024 },
-            Cfg { threads: 1, read: true, p: 64, q: 64 },
-            Cfg { threads, read: true, p: 1024, q: 1024 },
+            Cfg { threads, read: false, p: 1024, q: 1024, dense: false },
+            Cfg { threads, read: true, p: 1024, q: 1024, dense: false },
+            Cfg { threads, read: true, p: 256, q: 256, dense: false },
+            Cfg { threads, read: true, p: 64, q: 64, dense: false },
+            Cfg { threads, read: false, p: 64, q: 64, dense: false },
+            Cfg { threads: 4, read: true, p: 1024, q: 1024, dense: false },
+            Cfg { threads: 1, read: true, p: 1024, q: 1024, dense: false },
+            Cfg { threads: 1, read: true, p: 64, q: 64, dense: false },
+            Cfg { threads, read: true, p: 1024, q: 1024, dense: false },
         ];
         for c in &configs {
             pipeline(c, &data_dir, &out_dir);
@@ -1470,6 +1603,7 @@ fn main() {
 
 fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
     let t0 = Instant::now();
+    DEDUP_DENSE.store(cfg.dense, Ordering::Relaxed);
     let threads = cfg.threads;
     let manifest = std::fs::read_to_string(data_dir.join("manifest.json")).expect("manifest");
     let ws = manifest_ts(&manifest, "window_start");
@@ -1653,7 +1787,11 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
     let ncat = cat_names.len();
     let mut order: Vec<(usize, usize)> = (0..Q).map(|q| (mids.iter().map(|m| m.ev[q].len()).sum::<usize>(), q)).collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
-    let states: Vec<St> = parallel(
+    let ud_dir = out_dir.join("user_daily");
+    let cd_dir = out_dir.join("campaign_daily");
+    std::fs::create_dir_all(&ud_dir).unwrap();
+    std::fs::create_dir_all(&cd_dir).unwrap();
+    let states: Vec<St> = parallel_fin(
         threads,
         Q,
         || St {
@@ -1817,6 +1955,11 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
             st.evs = evs;
             st.cks = cks;
         }),
+        |st, wi| {
+            // write this worker's user_daily rows while other workers finish their buckets
+            let path = ud_dir.join(format!("part-{:05}.parquet", wi));
+            timed!(A_WRITE, write_user_daily(&path, &st.rows, &cat_names, longs));
+        },
     );
     let mids = std::mem::ManuallyDrop::new(mids);
     let _ = &mids;
@@ -1833,21 +1976,8 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
     }
 
     log(&t0, "campaigns merged");
-    // ---- write outputs
-    let ud_dir = out_dir.join("user_daily");
-    let cd_dir = out_dir.join("campaign_daily");
-    std::fs::create_dir_all(&ud_dir).unwrap();
-    std::fs::create_dir_all(&cd_dir).unwrap();
-    std::thread::scope(|sc| {
-        for (ti, s) in states.iter().enumerate() {
-            let path = ud_dir.join(format!("part-{:05}.parquet", ti));
-            let cat_names = &cat_names;
-            sc.spawn(move || timed!(A_WRITE, write_user_daily(&path, &s.rows, cat_names, longs)));
-        }
-        let path = cd_dir.join("part-00000.parquet");
-        let (camp, camp_ids, camp_channels) = (&camp, &camp_ids, &camp_channels);
-        sc.spawn(move || write_campaign_daily(&path, camp, ndays, day0, camp_ids, camp_channels));
-    });
+    // ---- write campaign_daily (user_daily was written by the session workers)
+    write_campaign_daily(&cd_dir.join("part-00000.parquet"), &camp, ndays, day0, &camp_ids, &camp_channels);
     log(&t0, "done");
     if !cfg!(feature = "diag") {
         std::mem::forget(states);
@@ -2338,6 +2468,45 @@ mod tests {
             radix_sort_by(&mut v, &mut tmp, |e| e.ts);
             w.sort_by_key(|e| e.ts); // stable, like LSD radix
             assert!(v.iter().zip(w.iter()).all(|(a, b)| a.ts == b.ts && a.person == b.person));
+        }
+    }
+
+    #[test]
+    fn simd_key_matches() {
+        let mut x: u64 = 0x1234_5678_9abc;
+        let alpha: &[u8] = b"09_az/:`{^AZ \r\x00\xff\x7f\x80\x2f\x3a\x60\x7b\x5e\x5f\x61\x7a\x30\x39";
+        let mut buf = [0u8; 40];
+        for _ in 0..400000 {
+            for b in buf.iter_mut() {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                *b = if x & 3 != 0 { b"abcdefghijklmnopqrstuvwxyz0123456789_"[(x >> 8) as usize % 37] } else { alpha[(x >> 8) as usize % alpha.len()] };
+            }
+            let off = (x >> 33) as usize % 8;
+            let n = (x >> 40) as usize % 15;
+            let f = &buf[off..off + n];
+            assert_eq!(unsafe { simd_key16(f) }, fast_key(f), "{:?}", f);
+            assert_eq!(fast_key_at(f, buf.as_ptr() as usize + buf.len()), fast_key(f));
+        }
+    }
+
+    #[test]
+    fn civil_swar_matches() {
+        let mut dc = DateCache::new();
+        let mut x: u64 = 99;
+        let bases: [&[u8]; 4] = [b"2026-10-03T23:58:10Z", b"2028-02-29T00:00:00Z", b"2026-10-03T19:58:10-04:00", b"1999-12-31T23:59:59+23:59"];
+        let subst = b"0123456789-:TZ+ t/;\x00\xff\x2f\x3a\x8a";
+        for _ in 0..300000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let mut v = bases[(x >> 3) as usize % 4].to_vec();
+            for k in 0..((x >> 6) % 3) {
+                let pos = ((x >> (10 + 8 * k)) as usize) % v.len();
+                v[pos] = subst[((x >> (20 + 7 * k)) as usize) % subst.len()];
+            }
+            assert_eq!(parse_ts_c(&v, &mut dc), parse_ts(&v), "{:?}", String::from_utf8_lossy(&v));
         }
     }
 
