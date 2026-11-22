@@ -1724,61 +1724,53 @@ fn main() {
     };
     #[cfg(feature = "diag")]
     {
-        COMPACT.store(true, Ordering::Relaxed);
+        // Each variant is a separate binary run as a fresh child process (like a scored run);
+        // wall time measured from outside. Output kept short: the scorer shows ~3.5 KB.
+        let _ = diag::bench_parse;
+        let rd = |p: &str| std::fs::read_to_string(p).unwrap_or_default();
+        let cpu = rd("/proc/cpuinfo");
+        let model = cpu.lines().find(|l| l.starts_with("model name")).unwrap_or("").replace("model name\t: ", "");
         let scratch = PathBuf::from(std::env::var("SCRATCH_DIR").unwrap_or_else(|_| "/scratch".into()));
         let gen_dir = scratch.join("gen20");
         let generator = std::env::var("SS_GENERATOR").unwrap_or_else(|_| "/app/generate".into());
-        if Path::new(&generator).exists() {
-            let t = Instant::now();
-            let st = std::process::Command::new(&generator)
-                .args(["--seed", "7", "--events", "20000000", "--clicks", "5000000", "--output"])
-                .arg(&gen_dir)
-                .stdout(std::process::Stdio::null())
-                .status();
-            eprintln!("generate 20M: {:?} in {:.2}s", st, t.elapsed().as_secs_f64());
-            let big_out = scratch.join("out20");
-            let big = [
-                Cfg { threads, read: false, p: 1024, q: 1024, dense: false },
-                Cfg { threads, read: false, p: 1024, q: 1024, dense: false },
-                Cfg { threads, read: false, p: 1024, q: 1024, dense: false },
-                Cfg { threads, read: false, p: 256, q: 1024, dense: false },
-                Cfg { threads: 1, read: false, p: 1024, q: 1024, dense: false },
-            ];
-            for c in &big {
-                let _ = std::fs::remove_dir_all(&big_out);
-                std::fs::create_dir_all(&big_out).unwrap();
-                let (u0, s0) = cpu_times();
-                pipeline(c, &gen_dir, &big_out);
-                let (u1, s1) = cpu_times();
-                let line = std::mem::take(&mut *LOGBUF.lock().unwrap());
-                eprintln!("B t{} p{} cpu{:.2}/{:.2} {}{}", c.threads, c.p, u1 - u0, s1 - s0, line, acc_report());
+        let t = Instant::now();
+        let st = std::process::Command::new(&generator)
+            .args(["--seed", "7", "--events", "20000000", "--clicks", "5000000", "--output"])
+            .arg(&gen_dir)
+            .stdout(std::process::Stdio::null())
+            .status();
+        eprintln!("gen {:?} {:.1}s | {} | {}", st.map(|s| s.code()), t.elapsed().as_secs_f64(), model.trim(), rd("/app/build-info.txt").trim());
+        let bin_dir = std::env::var("SS_BINS").unwrap_or_else(|_| "/app".into());
+        let names = ["sol-v3", "sol-pgo", "sol-v4", "sol-pgo-v4"];
+        let variants: Vec<(&str, PathBuf)> = names.iter().map(|n| (*n, Path::new(&bin_dir).join(n))).filter(|v| v.1.exists()).collect();
+        let rounds = 4;
+        let mut res: Vec<Vec<(f64, f64, f64)>> = vec![Vec::new(); variants.len()];
+        for _ in 0..rounds {
+            for (vi, v) in variants.iter().enumerate() {
+                let out = scratch.join("outc");
+                let _ = std::fs::remove_dir_all(&out);
+                std::fs::create_dir_all(&out).unwrap();
+                let mut cmd = std::process::Command::new(&v.1);
+                cmd.env("DATA_DIR", &gen_dir).env("OUTPUT_DIR", &out);
+                cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+                let mut r0: libc::rusage = unsafe { std::mem::zeroed() };
+                unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut r0) };
+                let t = Instant::now();
+                let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
+                let wall = t.elapsed().as_secs_f64();
+                let mut r1: libc::rusage = unsafe { std::mem::zeroed() };
+                unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut r1) };
+                let tv = |a: libc::timeval, b: libc::timeval| (b.tv_sec - a.tv_sec) as f64 + (b.tv_usec - a.tv_usec) as f64 / 1e6;
+                res[vi].push((if ok { wall } else { 99.0 }, tv(r0.ru_utime, r1.ru_utime), tv(r0.ru_stime, r1.ru_stime)));
             }
-            unsafe { std::env::set_var("BENCH_PARSE", "1") };
-            for th in [1usize, 8] {
-                unsafe { std::env::set_var("BENCH_THREADS", th.to_string()) };
-                pipeline(&big[0], &gen_dir, &big_out);
-            }
-        } else {
-            eprintln!("no generator at {}", generator);
         }
-        let configs: [Cfg; 0] = [];
-        let _unused = [
-            Cfg { threads, read: false, p: 1024, q: 1024, dense: false },
-            Cfg { threads, read: true, p: 1024, q: 1024, dense: false },
-            Cfg { threads, read: true, p: 256, q: 256, dense: false },
-            Cfg { threads, read: true, p: 64, q: 64, dense: false },
-            Cfg { threads, read: false, p: 64, q: 64, dense: false },
-            Cfg { threads: 4, read: true, p: 1024, q: 1024, dense: false },
-            Cfg { threads: 1, read: true, p: 1024, q: 1024, dense: false },
-            Cfg { threads: 1, read: true, p: 64, q: 64, dense: false },
-            Cfg { threads, read: true, p: 1024, q: 1024, dense: false },
-        ];
-        for c in &configs {
-            pipeline(c, &data_dir, &out_dir);
-            let line = std::mem::take(&mut *LOGBUF.lock().unwrap());
-            eprintln!("cfg t={} read={} p={}:{}", c.threads, c.read as u8, c.p, line);
+        for (vi, v) in variants.iter().enumerate() {
+            let r = &res[vi];
+            let walls: Vec<String> = r.iter().map(|x| format!("{:.0}", x.0 * 1000.0)).collect();
+            let best = r.iter().map(|x| x.0).fold(f64::MAX, f64::min);
+            let (u, sy) = r.iter().fold((0.0, 0.0), |a, x| (a.0 + x.1, a.1 + x.2));
+            eprintln!("{:<11} min {:.0} ms [{}] u{:.2} s{:.2}", v.0, best * 1000.0, walls.join(","), u / r.len() as f64, sy / r.len() as f64);
         }
-        let _ = diag::bench_parse;
         eprintln!("DIAG build: exiting 1 on purpose to get logs");
         std::process::exit(1);
     }
