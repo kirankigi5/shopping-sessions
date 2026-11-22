@@ -480,7 +480,7 @@ unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
 #[inline(always)]
 #[inline(always)]
 fn scan_lines<'a, const N: usize>(data: &'a [u8], on_line: impl FnMut(&[&'a [u8]; N])) {
-    scan_lines3::<N>(data, on_line)
+    scan_lines_ref::<N>(data, on_line)
 }
 
 #[inline(always)]
