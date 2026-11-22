@@ -11,8 +11,8 @@ Read this first. It covers the goal, the current state, the evidence collected s
   output row scores nothing.
 - Final: ~60M fresh events, timed 3 times, each capped at 3 minutes; median counts. The top 10 are retimed 9 times
   on an idle machine. Practice times vary up to ~20% between scoring machines.
-- **Current #1: 0.5084 s. Our best: 1.1889 s** (commit `18dc333`; `34cfe6c` scored 1.1952, the same within noise).
-  We need about 2.3x more speed.
+- **Current #1: 0.5084 s. Our best: 1.1390 s** (commit `1354d69`, scored Sun 12:44 AM, entered in the final).
+  We need about 2.24x more speed (cut ~630 ms).
 - Submissions: 2 per hour (rolling). The user submits on the web page. Rejected submissions do not change the best
   score. The final uses the best commit unless the user picks another.
 
@@ -106,9 +106,9 @@ time cap.
 | 77e6594 | 1.23 s | sessions: local person IDs + counting sort |
 | 18dc333 | **1.19 s** | skip freeing memory and exit at once, allocation-free key compare, windowed key encoding |
 | 34cfe6c | 1.20 s | people-sized session table, borrowed click-ID compare, shared output bytes, largest buckets first |
-| 1354d69 | not yet submitted | custom Parquet writer, dedup loser flags + sequential emit, radix sort for whales, uninitialized grouping buffers |
+| 1354d69 | **1.139 s (best)** | custom Parquet writer, dedup loser flags + sequential emit, radix sort for whales, uninitialized grouping buffers |
 
-**Submit `1354d69` next** (verified: fixtures, dev, amd64, 6 seeds).
+`1354d69` is the current best and the final entry. `main` HEAD only adds this document (same binary).
 
 ## 6. Current architecture (src/main.rs `pipeline()`)
 
@@ -146,8 +146,8 @@ real bytes when either key is long.
 
 ## 8. What to do next (priority order)
 
-1. **Submit `1354d69`** and record the score. Then optionally submit diag `03019ab` (same code plus
-   instrumentation) for scorer phase timings of the new code.
+1. Optionally submit diag `03019ab` (same code as `1354d69` plus instrumentation, exits 1 on purpose) to get
+   scorer phase timings of the current best before starting the next big change.
 2. **Cut intermediate memory traffic (the biggest lever).** Today each event is written as a 32 B ERec, read in
    dedup, written as a 16 B SRec, then copied again during grouping. Ideas:
    - Build the links first, in parallel: parse link lines on all threads, then run union-find (~0.2 s single
