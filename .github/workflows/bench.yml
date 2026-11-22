@@ -33,11 +33,12 @@ jobs:
           DATA_DIR=/dev/shm/d OUTPUT_DIR=/tmp/oa /tmp/base.bin 2>/dev/null; DATA_DIR=/dev/shm/d OUTPUT_DIR=/tmp/ob /tmp/new 2>/dev/null
           pip install -q pyarrow >/dev/null 2>&1
           python3 -c "
-          import pyarrow.parquet as pq, sys
+          import pyarrow.parquet as pq
           for t in ['user_daily','campaign_daily']:
-              a=pq.read_table('/tmp/oa/'+t).to_pandas(); b=pq.read_table('/tmp/ob/'+t).to_pandas()
-              cols=sorted(a.columns); a=a[cols].sort_values(cols).reset_index(drop=True); b=b[cols].sort_values(cols).reset_index(drop=True)
-              print(t, 'MATCH' if a.astype(str).equals(b.astype(str)) else 'DIFF', len(a), len(b))
+              a=pq.read_table('/tmp/oa/'+t); b=pq.read_table('/tmp/ob/'+t)
+              cols=sorted(a.column_names); k=[(c,'ascending') for c in cols]
+              a=a.select(cols).sort_by(k); b=b.select(cols).sort_by(k)
+              print(t, 'MATCH' if a.equals(b) else 'DIFF', a.num_rows, b.num_rows)
           "
       - name: A/B timing
         run: |
