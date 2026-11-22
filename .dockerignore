@@ -1,0 +1,6 @@
+target/
+fixtures/
+scripts/
+tools/
+*.md
+.git
