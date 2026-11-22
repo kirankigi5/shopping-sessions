@@ -432,7 +432,7 @@ fn csv_files(dir: &Path) -> Vec<PathBuf> {
     v
 }
 
-fn map_files(paths: &[PathBuf]) -> Vec<Option<Mmap>> {
+fn map_files_raw(paths: &[PathBuf]) -> Vec<Option<Mmap>> {
     paths
         .iter()
         .map(|p| {
@@ -442,13 +442,77 @@ fn map_files(paths: &[PathBuf]) -> Vec<Option<Mmap>> {
                 return None;
             }
             let m = unsafe { Mmap::map(&f).ok()? };
-            let _ = m.advise(memmap2::Advice::WillNeed);
+            let _ = m.advise(memmap2::Advice::Sequential);
             Some(m)
         })
         .collect()
 }
 
-fn make_chunks(maps: &[Option<Mmap>], target: usize) -> Vec<Chunk> {
+enum Buf {
+    M(Mmap),
+    V(Vec<u8>),
+}
+impl std::ops::Deref for Buf {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Buf::M(m) => m,
+            Buf::V(v) => v,
+        }
+    }
+}
+
+/// Loads files either as mmaps or by reading them into memory, 8 MB pieces in parallel.
+fn load_files(paths: &[PathBuf], read: bool, threads: usize) -> Vec<Option<Buf>> {
+    if !read {
+        return map_files_raw(paths).into_iter().map(|m| m.map(Buf::M)).collect();
+    }
+    use std::os::unix::fs::FileExt;
+    let files: Vec<Option<(File, usize)>> = paths
+        .iter()
+        .map(|p| {
+            let f = File::open(p).ok()?;
+            let len = f.metadata().ok()?.len() as usize;
+            if len == 0 { None } else { Some((f, len)) }
+        })
+        .collect();
+    let mut bufs: Vec<Vec<u8>> = files
+        .iter()
+        .map(|f| match f {
+            Some((_, len)) => {
+                let mut v = Vec::with_capacity(*len);
+                unsafe { v.set_len(*len) };
+                v
+            }
+            None => Vec::new(),
+        })
+        .collect();
+    const PIECE: usize = 8 << 20;
+    struct Piece {
+        file: usize,
+        off: usize,
+        ptr: usize,
+        len: usize,
+    }
+    let mut pieces: Vec<Piece> = Vec::new();
+    for (fi, b) in bufs.iter_mut().enumerate() {
+        let mut off = 0;
+        while off < b.len() {
+            let len = PIECE.min(b.len() - off);
+            pieces.push(Piece { file: fi, off, ptr: b.as_mut_ptr() as usize + off, len });
+            off += len;
+        }
+    }
+    parallel(threads, pieces.len(), || (), |_, i| {
+        let pc = &pieces[i];
+        let (f, _) = files[pc.file].as_ref().unwrap();
+        let dst = unsafe { std::slice::from_raw_parts_mut(pc.ptr as *mut u8, pc.len) };
+        f.read_exact_at(dst, pc.off as u64).expect("read");
+    });
+    bufs.into_iter().map(|v| if v.is_empty() { None } else { Some(Buf::V(v)) }).collect()
+}
+
+fn make_chunks(maps: &[Option<Buf>], target: usize) -> Vec<Chunk> {
     let mut out = Vec::new();
     for (fi, m) in maps.iter().enumerate() {
         let Some(m) = m else { continue };
@@ -474,7 +538,7 @@ fn make_chunks(maps: &[Option<Mmap>], target: usize) -> Vec<Chunk> {
     out
 }
 
-fn chunk_data<'a>(maps: &'a [Option<Mmap>], c: &Chunk) -> &'a [u8] {
+fn chunk_data<'a>(maps: &'a [Option<Buf>], c: &Chunk) -> &'a [u8] {
     &maps[c.file].as_ref().unwrap()[c.start..c.end]
 }
 
@@ -558,8 +622,16 @@ struct URow {
 }
 const NO_CAT: u16 = u16::MAX;
 
+static COMPACT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LOGBUF: Mutex<String> = Mutex::new(String::new());
+
 fn log(start: &Instant, msg: &str) {
-    eprintln!("[{:7.3}s] {}", start.elapsed().as_secs_f64(), msg);
+    if COMPACT.load(Ordering::Relaxed) {
+        let word = msg.split(|c: char| c == ' ' || c == ':' || c == '(').next().unwrap_or("");
+        LOGBUF.lock().unwrap().push_str(&format!(" {}={:.0}", word, start.elapsed().as_secs_f64() * 1000.0));
+    } else {
+        eprintln!("[{:7.3}s] {}", start.elapsed().as_secs_f64(), msg);
+    }
 }
 
 fn manifest_ts(text: &str, key: &str) -> i64 {
@@ -614,7 +686,7 @@ fn parse_events(data: &[u8], c: &EvCtx, out: &mut [Vec<ERec>]) {
     });
 }
 
-fn build_person_map(maps: &[Option<Mmap>], chunks: &[Chunk]) -> FastMap<u64, u64> {
+fn build_person_map(maps: &[Option<Buf>], chunks: &[Chunk]) -> FastMap<u64, u64> {
     let mut ids: FastMap<u64, u32> = FastMap::default();
     let mut keys: Vec<u64> = Vec::new();
     let mut parent: Vec<u32> = Vec::new();
@@ -680,8 +752,18 @@ fn build_person_map(maps: &[Option<Mmap>], chunks: &[Chunk]) -> FastMap<u64, u64
     m
 }
 
+struct Cfg {
+    threads: usize,
+    read: bool,
+    p: usize,
+    q: usize,
+}
+
+fn env_usize(k: &str, d: usize) -> usize {
+    std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
+}
+
 fn main() {
-    let t0 = Instant::now();
     let data_dir = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let out_dir = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
     let threads: usize = std::env::var("NCPU")
@@ -689,9 +771,42 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4))
         .clamp(1, 64);
-
+    let cfg = Cfg {
+        threads,
+        read: env_usize("SS_READ", 1) == 1,
+        p: env_usize("SS_P", 1024).next_power_of_two(),
+        q: env_usize("SS_Q", 1024).next_power_of_two(),
+    };
     #[cfg(feature = "diag")]
-    diag::run(&data_dir);
+    {
+        COMPACT.store(true, Ordering::Relaxed);
+        let configs = [
+            Cfg { threads, read: false, p: 1024, q: 1024 },
+            Cfg { threads, read: true, p: 1024, q: 1024 },
+            Cfg { threads, read: true, p: 256, q: 256 },
+            Cfg { threads, read: true, p: 64, q: 64 },
+            Cfg { threads, read: false, p: 64, q: 64 },
+            Cfg { threads: 4, read: true, p: 1024, q: 1024 },
+            Cfg { threads: 1, read: true, p: 1024, q: 1024 },
+            Cfg { threads: 1, read: true, p: 64, q: 64 },
+            Cfg { threads, read: true, p: 1024, q: 1024 },
+        ];
+        for c in &configs {
+            pipeline(c, &data_dir, &out_dir);
+            let line = std::mem::take(&mut *LOGBUF.lock().unwrap());
+            eprintln!("cfg t={} read={} p={}:{}", c.threads, c.read as u8, c.p, line);
+        }
+        diag::bench_parse(&data_dir);
+        eprintln!("DIAG build: exiting 1 on purpose to get logs");
+        std::process::exit(1);
+    }
+    #[allow(unreachable_code)]
+    pipeline(&cfg, &data_dir, &out_dir);
+}
+
+fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
+    let t0 = Instant::now();
+    let threads = cfg.threads;
     let manifest = std::fs::read_to_string(data_dir.join("manifest.json")).expect("manifest");
     let ws = manifest_ts(&manifest, "window_start");
     let we = manifest_ts(&manifest, "window_end");
@@ -733,9 +848,9 @@ fn main() {
     let ev_paths = csv_files(&data_dir.join("events"));
     let ck_paths = csv_files(&data_dir.join("clicks"));
     let lk_paths = csv_files(&data_dir.join("links"));
-    let ev_maps = map_files(&ev_paths);
-    let ck_maps = map_files(&ck_paths);
-    let lk_maps = map_files(&lk_paths);
+    let ev_maps = load_files(&ev_paths, cfg.read, threads);
+    let ck_maps = load_files(&ck_paths, cfg.read, threads);
+    let lk_maps = load_files(&lk_paths, cfg.read, threads);
     let chunk_target = 2 << 20;
     let ev_chunks = make_chunks(&ev_maps, chunk_target);
     let ck_chunks = make_chunks(&ck_maps, chunk_target);
@@ -770,16 +885,19 @@ fn main() {
         return;
     }
 
-    const P: usize = 1024;
-    const PM: usize = P - 1;
-    const Q: usize = 1024;
-    const QM: usize = Q - 1;
+    let P: usize = cfg.p;
+    let Q: usize = cfg.q;
+    let QM: usize = Q - 1;
     let est_events = ev_bytes / 80 + 1024;
     let est_clicks = ck_bytes / 45 + 1024;
 
     // ---- links (background) + events parse
     let (person_map, ev_parts) = std::thread::scope(|sc| {
-        let lk = sc.spawn(|| build_person_map(&lk_maps, &lk_chunks));
+        let lk = sc.spawn(|| {
+            let m = build_person_map(&lk_maps, &lk_chunks);
+            log(&t0, "links built");
+            m
+        });
         let cap = est_events / threads / P * 5 / 4 + 16;
         let ctx = EvCtx { ws, we, ingest_base, products: &products, unknown_cat };
         let ev_parts: Vec<Vec<Vec<ERec>>> = parallel(
@@ -949,11 +1067,6 @@ fn main() {
         sc.spawn(move || write_campaign_daily(&path, camp, ndays, day0, camp_ids, camp_channels));
     });
     log(&t0, "done");
-    #[cfg(feature = "diag")]
-    {
-        eprintln!("DIAG build: exiting 1 on purpose to get logs");
-        std::process::exit(1);
-    }
 }
 
 struct St {
