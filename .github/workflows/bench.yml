@@ -1,0 +1,46 @@
+name: bench
+on:
+  push:
+    branches: [bench]
+  workflow_dispatch:
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: machine
+        run: |
+          lscpu | head -25; nproc; free -g
+          cat /sys/kernel/mm/transparent_hugepage/enabled /sys/kernel/mm/transparent_hugepage/defrag; uname -r
+      - name: tools
+        run: |
+          sudo apt-get update -qq >/dev/null
+          sudo apt-get install -y -qq linux-tools-common linux-tools-$(uname -r) >/dev/null 2>&1 || sudo apt-get install -y -qq linux-tools-generic >/dev/null 2>&1 || true
+          sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+          (ls /usr/lib/linux-tools/*/perf; which perf) || true
+      - name: build
+        run: |
+          rustc --version
+          RUSTFLAGS="-C target-cpu=x86-64-v3 -C force-frame-pointers=yes" CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build --release --locked -q
+          (cd gen && cargo build --release -q)
+      - name: generate 20M into tmpfs
+        run: |
+          gen/target/release/generate --seed 7 --events 20000000 --clicks 5000000 --output /dev/shm/d >/dev/null
+          du -sh /dev/shm/d
+      - name: timing
+        run: |
+          B=target/release/solution
+          for t in 4 4 4 1; do rm -rf /tmp/o; mkdir /tmp/o; /usr/bin/time -f "wall=%e user=%U sys=%S maxrss=%MKB" env NCPU=$t DATA_DIR=/dev/shm/d OUTPUT_DIR=/tmp/o $B; done 2>&1
+          SS_READ=1 BENCH_PARSE=1 BENCH_THREADS=1 DATA_DIR=/dev/shm/d OUTPUT_DIR=/tmp/o $B 2>&1 | tail -1
+      - name: perf
+        run: |
+          P=$( (ls /usr/lib/linux-tools/*/perf 2>/dev/null; which perf) | head -1 ); echo "perf=$P"
+          B=target/release/solution
+          rm -rf /tmp/o; mkdir /tmp/o
+          $P stat -e cycles,instructions,branches,branch-misses,cache-references,cache-misses,L1-dcache-load-misses,dTLB-load-misses,dTLB-store-misses env NCPU=4 DATA_DIR=/dev/shm/d OUTPUT_DIR=/tmp/o $B 2>&1 | tail -25 || true
+          rm -rf /tmp/o; mkdir /tmp/o
+          $P record -F 999 -o /tmp/perf.data env NCPU=4 DATA_DIR=/dev/shm/d OUTPUT_DIR=/tmp/o $B 2>&1 | tail -3 || true
+          $P report -i /tmp/perf.data --stdio --no-children --sort sym 2>/dev/null | grep -v '^#' | grep -v '^$' | head -45 || true
+          for s in parse_events dedup_emit; do echo "=== hottest lines in $s"; $P annotate -i /tmp/perf.data --stdio -l -s $(nm -C $B | grep -m1 " solution::$s\b" | awk '{print $3}') 2>/dev/null | grep -E '^ +[0-9]+\.[0-9]+ ' | sort -rn | head -30; done || true
+          $P report -i /tmp/perf.data --stdio --no-children --sort srcline 2>/dev/null | grep -v '^#' | grep -v '^$' | head -60 || true
