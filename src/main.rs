@@ -1057,11 +1057,7 @@ fn log(start: &Instant, msg: &str) {
             x => x,
         };
         let (u, sy) = cpu_times();
-        let mut lb = LOGBUF.lock().unwrap();
-        if lb.is_empty() {
-            *lb = format!("@{:.0}/{:.0}", u * 1000.0, sy * 1000.0);
-        }
-        lb.push_str(&format!(" {}={:.0}:{:.0}/{:.0}", word, start.elapsed().as_secs_f64() * 1000.0, u * 1000.0, sy * 1000.0));
+        LOGBUF.lock().unwrap().push_str(&format!(" {}={:.0}[u{:.0},s{:.0}]", word, start.elapsed().as_secs_f64() * 1000.0, u * 1000.0, sy * 1000.0));
     } else {
         eprintln!("[{:7.3}s] {}", start.elapsed().as_secs_f64(), msg);
     }
@@ -1424,7 +1420,12 @@ fn main() {
                 pipeline(c, &gen_dir, &big_out);
                 let (u1, s1) = cpu_times();
                 let line = std::mem::take(&mut *LOGBUF.lock().unwrap());
-                eprintln!("B t{} r{} p{} cpu{:.2}/{:.2} {}", c.threads, c.read as u8, c.p, u1 - u0, s1 - s0, line);
+                eprintln!("B t{} p{} cpu{:.2}/{:.2} {}{}", c.threads, c.p, u1 - u0, s1 - s0, line, acc_report());
+            }
+            unsafe { std::env::set_var("BENCH_PARSE", "1") };
+            for th in [1usize, 8] {
+                unsafe { std::env::set_var("BENCH_THREADS", th.to_string()) };
+                pipeline(&big[0], &gen_dir, &big_out);
             }
         } else {
             eprintln!("no generator at {}", generator);
