@@ -2262,7 +2262,8 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
         Q,
         || St {
             rows: Vec::with_capacity(est_events / 8 / threads + 16),
-            camp: vec![[0; 4]; ncols * ndays],
+            camp: vec![Cred::default(); ncols * ndays],
+            assist: vec![0; ncols * ndays],
             counts: vec![0; ncols],
             active: Vec::new(),
             pos: vec![0; ncols],
@@ -2434,10 +2435,11 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
     // ---- campaign_daily: merge
     let mut camp = vec![[0i64; 4]; ncols * ndays];
     for s in &states {
-        for (a, b) in camp.iter_mut().zip(s.camp.iter()) {
-            for x in 0..4 {
-                a[x] += b[x];
-            }
+        for ((a, b), &x) in camp.iter_mut().zip(s.camp.iter()).zip(s.assist.iter()) {
+            a[0] += b.s as i64;
+            a[1] += b.p as i64;
+            a[2] += b.rev;
+            a[3] += x as i64;
         }
     }
 
@@ -2457,9 +2459,17 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct Cred {
+    s: u32,
+    p: u32,
+    rev: i64,
+}
+
 struct St {
     rows: Vec<URow>,
-    camp: Vec<[i64; 4]>, // [camp * ndays + day] -> sessions, purchasing, revenue, assisted
+    camp: Vec<Cred>,  // [camp * ndays + day] -> credited sessions, purchasing, revenue
+    assist: Vec<u32>, // [camp * ndays + day] -> assisted sessions
     counts: Vec<u32>,
     active: Vec<u32>,
     pos: Vec<u32>,
@@ -2643,12 +2653,12 @@ fn process_person(st: &mut St, person: u64, evs: &[u64], pc: &[CRec], ws: i64, d
             organic
         };
         let cell = &mut st.camp[credit as usize * ndays + di];
-        cell[0] += 1;
-        cell[1] += purch as i64;
-        cell[2] += rev;
+        cell.s += 1;
+        cell.p += purch as u32;
+        cell.rev += rev;
         for ai in 0..st.active.len() {
             let a = st.active[ai] as usize;
-            st.camp[a * ndays + di][3] += 1;
+            st.assist[a * ndays + di] += 1;
         }
     }
     if cur_day != i32::MIN {
