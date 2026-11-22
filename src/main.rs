@@ -480,7 +480,11 @@ unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
 #[inline(always)]
 #[inline(always)]
 fn scan_lines<'a, const N: usize>(data: &'a [u8], on_line: impl FnMut(&[&'a [u8]; N])) {
-    scan_lines_ref::<N>(data, on_line)
+    if SW.load(Ordering::Relaxed) & SW_TOK3 != 0 {
+        scan_lines3::<N>(data, on_line)
+    } else {
+        scan_lines_ref::<N>(data, on_line)
+    }
 }
 
 #[inline(always)]
@@ -545,6 +549,12 @@ fn scan_lines_ref<'a, const N: usize>(data: &'a [u8], mut on_line: impl FnMut(&[
         }
     }
 }
+
+/// Diag switches (bits): new tokenizer, SWAR F3, person-map bloom filter.
+static SW: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(SW_F3 | SW_BLOOM);
+const SW_TOK3: u32 = 1;
+const SW_F3: u32 = 2;
+const SW_BLOOM: u32 = 4;
 
 /// 128 bits of a bitmask array starting at bit `pos` (array must have 2 spare words past pos/64).
 #[inline(always)]
@@ -992,7 +1002,7 @@ fn parse_ts_c(f: &[u8], dc: &mut DateCache, dend: usize) -> Option<i64> {
         let off = (oh * 60 + om) * 60_000;
         return Some(if f[19] == b'+' { base - off } else { base + off });
     }
-    parse_f3_fast(f, dend)
+    if SW.load(Ordering::Relaxed) & SW_F3 != 0 { parse_f3_fast(f, dend) } else { parse_f3(f) }
 }
 
 /// Digits only, value 1..=10,000,000.
@@ -1416,12 +1426,21 @@ impl PersonMap {
     }
     #[inline(always)]
     fn prefetch_bloom(&self, k: u64) {
+        if SW.load(Ordering::Relaxed) & SW_BLOOM == 0 {
+            return self.prefetch(k);
+        }
         let p = unsafe { self.bloom.as_ptr().add(self.bloom_at(k).0) } as *const i8;
         prefetch_ptr(p);
     }
     /// Maps every key of `ks` to its person in place (two stages: filter, then probe the few hits).
     #[inline(always)]
     fn resolve(&self, ks: &mut [u64]) {
+        if SW.load(Ordering::Relaxed) & SW_BLOOM == 0 {
+            for k in ks.iter_mut() {
+                *k = self.person(*k);
+            }
+            return;
+        }
         let mut hit = [0u8; 64];
         let mut nh = 0usize;
         for (i, &k) in ks.iter().enumerate() {
@@ -1701,6 +1720,7 @@ struct Cfg {
     p: usize,
     q: usize,
     dense: bool,
+    sw: u32,
 }
 
 fn env_usize(k: &str, d: usize) -> usize {
@@ -1721,6 +1741,7 @@ fn main() {
         p: env_usize("SS_P", 1024).next_power_of_two(),
         q: env_usize("SS_Q", 1024).next_power_of_two(),
         dense: env_usize("SS_DENSE", 0) == 1,
+        sw: env_usize("SS_SW", 6) as u32,
     };
     #[cfg(feature = "diag")]
     {
@@ -1738,13 +1759,17 @@ fn main() {
             eprintln!("generate 20M: {:?} in {:.2}s", st, t.elapsed().as_secs_f64());
             let big_out = scratch.join("out20");
             let big = [
-                Cfg { threads, read: false, p: 1024, q: 1024, dense: false }, // baseline
-                Cfg { threads, read: false, p: 256, q: 1024, dense: false },  // fewer parse scatter streams
-                Cfg { threads, read: false, p: 4096, q: 1024, dense: false }, // smaller dedup tables
-                Cfg { threads, read: false, p: 1024, q: 256, dense: false },  // fewer emit scatter streams
-                Cfg { threads, read: false, p: 1024, q: 4096, dense: false }, // smaller session tables
-                Cfg { threads, read: false, p: 1024, q: 1024, dense: false }, // baseline again (noise)
-                Cfg { threads: 1, read: false, p: 1024, q: 1024, dense: false }, // single-thread CPU work
+                Cfg { threads, read: false, p: 1024, q: 1024, dense: false, sw: 0 }, // = scored best (1.0194)
+                Cfg { threads, read: false, p: 1024, q: 1024, dense: false, sw: 6 }, // = fast2 (F3 + bloom)
+                Cfg { threads, read: false, p: 1024, q: 1024, dense: false, sw: 2 }, // F3 only
+                Cfg { threads, read: false, p: 1024, q: 1024, dense: false, sw: 4 }, // bloom only
+                Cfg { threads, read: false, p: 1024, q: 1024, dense: false, sw: 7 }, // = fast1 (+ tok3)
+                Cfg { threads, read: false, p: 256, q: 1024, dense: false, sw: 6 },
+                Cfg { threads, read: false, p: 4096, q: 1024, dense: false, sw: 6 },
+                Cfg { threads, read: false, p: 1024, q: 256, dense: false, sw: 6 },
+                Cfg { threads, read: false, p: 1024, q: 4096, dense: false, sw: 6 },
+                Cfg { threads, read: false, p: 1024, q: 1024, dense: false, sw: 0 }, // repeat: noise
+                Cfg { threads, read: false, p: 1024, q: 1024, dense: false, sw: 6 }, // repeat: noise
             ];
             for c in &big {
                 let _ = std::fs::remove_dir_all(&big_out);
@@ -1753,27 +1778,28 @@ fn main() {
                 pipeline(c, &gen_dir, &big_out);
                 let (u1, s1) = cpu_times();
                 let line = std::mem::take(&mut *LOGBUF.lock().unwrap());
-                eprintln!("B t{} p{} q{} d{} cpu{:.2}/{:.2} {}{}", c.threads, c.p, c.q, c.dense as u8, u1 - u0, s1 - s0, line, acc_report());
+                eprintln!("B s{} t{} p{} q{} d{} cpu{:.2}/{:.2} {}{}", c.sw, c.threads, c.p, c.q, c.dense as u8, u1 - u0, s1 - s0, line, acc_report());
             }
             unsafe { std::env::set_var("BENCH_PARSE", "1") };
-            for th in [1usize, 8] {
-                unsafe { std::env::set_var("BENCH_THREADS", th.to_string()) };
-                pipeline(&big[0], &gen_dir, &big_out);
+            for bi in [0usize, 4] {
+                unsafe { std::env::set_var("BENCH_THREADS", "1") };
+                eprint!("s{} ", big[bi].sw);
+                pipeline(&big[bi], &gen_dir, &big_out);
             }
         } else {
             eprintln!("no generator at {}", generator);
         }
         let configs: [Cfg; 0] = [];
         let _unused = [
-            Cfg { threads, read: false, p: 1024, q: 1024, dense: false },
-            Cfg { threads, read: true, p: 1024, q: 1024, dense: false },
-            Cfg { threads, read: true, p: 256, q: 256, dense: false },
-            Cfg { threads, read: true, p: 64, q: 64, dense: false },
-            Cfg { threads, read: false, p: 64, q: 64, dense: false },
-            Cfg { threads: 4, read: true, p: 1024, q: 1024, dense: false },
-            Cfg { threads: 1, read: true, p: 1024, q: 1024, dense: false },
-            Cfg { threads: 1, read: true, p: 64, q: 64, dense: false },
-            Cfg { threads, read: true, p: 1024, q: 1024, dense: false },
+            Cfg { threads, read: false, p: 1024, q: 1024, dense: false, sw: 6 },
+            Cfg { threads, read: true, p: 1024, q: 1024, dense: false, sw: 6 },
+            Cfg { threads, read: true, p: 256, q: 256, dense: false, sw: 6 },
+            Cfg { threads, read: true, p: 64, q: 64, dense: false, sw: 6 },
+            Cfg { threads, read: false, p: 64, q: 64, dense: false, sw: 6 },
+            Cfg { threads: 4, read: true, p: 1024, q: 1024, dense: false, sw: 6 },
+            Cfg { threads: 1, read: true, p: 1024, q: 1024, dense: false, sw: 6 },
+            Cfg { threads: 1, read: true, p: 64, q: 64, dense: false, sw: 6 },
+            Cfg { threads, read: true, p: 1024, q: 1024, dense: false, sw: 6 },
         ];
         for c in &configs {
             pipeline(c, &data_dir, &out_dir);
@@ -1798,6 +1824,7 @@ fn main() {
 fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
     let t0 = Instant::now();
     DEDUP_DENSE.store(cfg.dense, Ordering::Relaxed);
+    SW.store(cfg.sw, Ordering::Relaxed);
     let threads = cfg.threads;
     let manifest = std::fs::read_to_string(data_dir.join("manifest.json")).expect("manifest");
     let ws = manifest_ts(&manifest, "window_start");
