@@ -1383,7 +1383,7 @@ fn buckets<T>(n: usize, cap: usize) -> Vec<Vec<T>> {
     (0..n).map(|_| Vec::with_capacity(cap)).collect()
 }
 
-/// One 64-byte cache line of K records.
+/// A staging block of K records (a multiple of 64 bytes, 64-byte aligned).
 #[derive(Clone, Copy)]
 #[repr(C, align(64))]
 struct Line<T: Copy, const K: usize>([T; K]);
@@ -1398,7 +1398,7 @@ struct NtBuckets<T: Copy, const K: usize> {
 }
 impl<T: Copy, const K: usize> NtBuckets<T, K> {
     fn new(n: usize, cap: usize) -> Self {
-        assert!(std::mem::size_of::<[T; K]>() == 64);
+        assert!(std::mem::size_of::<[T; K]>() % 64 == 0);
         let out = (0..n)
             .map(|_| {
                 // 64-byte aligned destination so every full line can be streamed
@@ -1430,7 +1430,10 @@ impl<T: Copy, const K: usize> NtBuckets<T, K> {
                     o.reserve(o.len().max(K));
                 }
                 let dst = o.as_mut_ptr().add(o.len());
-                stream_line(dst as *mut u8, line as *const Line<T, K> as *const u8);
+                let src = line as *const Line<T, K> as *const u8;
+                for l in 0..std::mem::size_of::<[T; K]>() / 64 {
+                    stream_line((dst as *mut u8).add(64 * l), src.add(64 * l));
+                }
                 o.set_len(o.len() + K);
             }
         }
@@ -1605,7 +1608,7 @@ struct EvCtx<'a> {
 }
 
 #[inline(never)]
-fn parse_events(data: &[u8], c: &EvCtx, out: &mut NtBuckets<ERec, 2>, longs: &mut LongLog) {
+fn parse_events(data: &[u8], c: &EvCtx, out: &mut NtBuckets<ERec, 4>, longs: &mut LongLog) {
     let mask = out.len() - 1;
     let mut dc = DateCache::new();
     let dend = data.as_ptr() as usize + data.len();
@@ -1802,12 +1805,12 @@ fn dedup_insert(ev_parts: &[Vec<Vec<ERec>>], b: usize, table: &mut Vec<Slot>, de
 
 /// Emits surviving (winning, valid) events in record order, mapped to persons and scattered.
 #[inline(never)]
-fn dedup_emit(ev_parts: &[Vec<Vec<ERec>>], b: usize, dead: &[bool], pm: &PersonMap, out: &mut NtBuckets<SRec, 4>) {
+fn dedup_emit(ev_parts: &[Vec<Vec<ERec>>], b: usize, dead: &[bool], pm: &PersonMap, out: &mut NtBuckets<SRec, 8>) {
     let qm = out.len() - 1;
     const BATCH: usize = 32;
     let mut buf: [(u64, u32, u32); BATCH] = [(0, 0, 0); BATCH];
     let mut n = 0usize;
-    let flush = |buf: &[(u64, u32, u32)], out: &mut NtBuckets<SRec, 4>| {
+    let flush = |buf: &[(u64, u32, u32)], out: &mut NtBuckets<SRec, 8>| {
         let mut ks = [0u64; BATCH];
         for (k, b) in ks.iter_mut().zip(buf) {
             *k = b.0;
@@ -2183,7 +2186,7 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
                 bt,
                 n,
                 || {
-                    let bk: NtBuckets<ERec, 2> = match variant {
+                    let bk: NtBuckets<ERec, 4> = match variant {
                         4 => NtBuckets::new(1, per),
                         5 => NtBuckets::new(1024, per / 1024 * 5 / 4 + 16),
                         _ => NtBuckets::new(1, 16),
@@ -2238,7 +2241,7 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
         });
         let cap = est_events / threads / P * 5 / 4 + 16;
         let ctx = EvCtx { ws, we, ingest_base, products: &products, unknown_cat };
-        let ev_states: Vec<(NtBuckets<ERec, 2>, LongLog)> = parallel(
+        let ev_states: Vec<(NtBuckets<ERec, 4>, LongLog)> = parallel(
             threads,
             ev_chunks.len(),
             || (NtBuckets::new(P, cap), LongLog::new()),
@@ -2263,7 +2266,7 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
 
     // ---- dedup events + parse clicks, both into person buckets
     struct Mid {
-        evb: Option<NtBuckets<SRec, 4>>,
+        evb: Option<NtBuckets<SRec, 8>>,
         ev: Vec<Vec<SRec>>,
         ck: Vec<Vec<CRec>>,
         table: Vec<Slot>,
