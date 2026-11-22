@@ -277,82 +277,7 @@ fn eq_key(s: &[u8]) -> u64 {
 }
 
 /// Per-thread map from a long key to its bytes (no locking).
-/// Flat open-addressing map: long key -> its bytes (in an arena). Key 0 marks an empty slot
-/// (long keys always have the top bit set). Prefetchable, unlike the std map it replaces.
-#[derive(Default)]
-struct LongMap {
-    slots: Vec<[u64; 2]>, // (key, entry index)
-    mask: usize,
-    arena: Vec<u8>,
-    ends: Vec<u32>,
-}
-impl LongMap {
-    fn is_empty(&self) -> bool {
-        self.ends.is_empty()
-    }
-    #[inline(always)]
-    fn prefetch(&self, k: u64) {
-        if !self.slots.is_empty() {
-            prefetch_ptr(unsafe { self.slots.as_ptr().add(mix(k) as usize & self.mask) } as *const i8);
-        }
-    }
-    fn bytes(&self, i: usize) -> &[u8] {
-        let a = if i == 0 { 0 } else { self.ends[i - 1] as usize };
-        &self.arena[a..self.ends[i] as usize]
-    }
-    fn get(&self, k: &u64) -> Option<&[u8]> {
-        if self.slots.is_empty() {
-            return None;
-        }
-        let mut h = mix(*k) as usize & self.mask;
-        loop {
-            let s = self.slots[h];
-            if s[0] == *k {
-                return Some(self.bytes(s[1] as usize));
-            }
-            if s[0] == 0 {
-                return None;
-            }
-            h = (h + 1) & self.mask;
-        }
-    }
-    /// Records `s` as the bytes of `k` unless `k` is already present.
-    #[inline(always)]
-    fn insert(&mut self, k: u64, s: &[u8]) {
-        if (self.ends.len() + 1) * 2 > self.slots.len() {
-            self.grow();
-        }
-        let mut h = mix(k) as usize & self.mask;
-        loop {
-            let sl = unsafe { self.slots.get_unchecked_mut(h) };
-            if sl[0] == k {
-                return;
-            }
-            if sl[0] == 0 {
-                *sl = [k, self.ends.len() as u64];
-                self.arena.extend_from_slice(s);
-                self.ends.push(self.arena.len() as u32);
-                return;
-            }
-            h = (h + 1) & self.mask;
-        }
-    }
-    #[cold]
-    fn grow(&mut self) {
-        let cap = (self.slots.len() * 2).max(1024);
-        let old = std::mem::replace(&mut self.slots, vec![[0, 0]; cap]);
-        self.mask = cap - 1;
-        for s in old {
-            if s[0] != 0 {
-                let mut h = mix(s[0]) as usize & self.mask;
-                while self.slots[h][0] != 0 {
-                    h = (h + 1) & self.mask;
-                }
-                self.slots[h] = s;
-            }
-        }
-    }
-}
+type LongMap = FastMap<u64, Box<[u8]>>;
 
 /// Key that also remembers the bytes of long IDs in `longs`, so they can be ordered and printed.
 #[inline(always)]
@@ -366,7 +291,7 @@ fn key(s: &[u8], longs: &mut LongMap) -> u64 {
 #[inline(never)]
 fn long_key(s: &[u8], longs: &mut LongMap) -> u64 {
     let k = SLOW | (hash_bytes(s) >> 1);
-    longs.insert(k, s);
+    longs.entry(k).or_insert_with(|| s.into());
     k
 }
 
@@ -1522,11 +1447,6 @@ fn parse_events(data: &[u8], c: &EvCtx, out: &mut NtBuckets<ERec, 2>, longs: &mu
         if f[0].is_empty() {
             return;
         }
-        // user key first: a long id's table slot is prefetched while the timestamps are parsed
-        let uk = eq_key_at(f[1], dend);
-        if uk & SLOW != 0 {
-            longs.prefetch(uk);
-        }
         let Some(ingest) = parse_ts_c(f[3], &mut dc, dend) else { return };
         let eid = eq_key_at(f[0], dend);
         let ing_rel = (ingest.div_euclid(1000) - c.ingest_base).clamp(0, u32::MAX as i64) as u32;
@@ -1547,10 +1467,7 @@ fn parse_events(data: &[u8], c: &EvCtx, out: &mut NtBuckets<ERec, 2>, longs: &mu
             } else if ty != b"view" && ty != b"cart" {
                 break 'v;
             }
-            if uk & SLOW != 0 {
-                longs.insert(uk, f[1]);
-            }
-            rec.user = uk;
+            rec.user = key_at(f[1], dend, longs);
             rec.ts = (ts - c.ws) as u32;
         }
         out.push(part_of(eid, mask), rec);
@@ -1782,7 +1699,7 @@ fn parse_clicks(
             }
             None => {
                 let k = SLOW | (0x3FF << 52) | (hash_bytes(f[0]) & ((1 << 52) - 1));
-                longs.insert(k, f[0]);
+                longs.entry(k).or_insert_with(|| f[0].into());
                 k
             }
         };
