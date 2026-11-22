@@ -947,9 +947,37 @@ fn civil_ms_c(f: &[u8], dc: &mut DateCache) -> Option<i64> {
     Some(day + ((h * 3600 + mi * 60 + sec) * 1000) as i64)
 }
 
+/// 8 ASCII digits (byte 0 most significant) -> value; None unless all are digits.
+#[inline(always)]
+fn digits8(v: u64) -> Option<u64> {
+    if ((v.wrapping_add(0x4646_4646_4646_4646)) | (v.wrapping_sub(0x3030_3030_3030_3030))) & 0x8080_8080_8080_8080 != 0 {
+        return None;
+    }
+    let mut v = v.wrapping_sub(0x3030_3030_3030_3030);
+    v = v.wrapping_mul(10).wrapping_add(v >> 8);
+    v = ((v & 0x0000_00FF_0000_00FF).wrapping_mul(0x000F_4240_0000_0064)).wrapping_add(((v >> 16) & 0x0000_00FF_0000_00FF).wrapping_mul(0x0000_2710_0000_0001)) >> 32;
+    Some(v & 0xFFFF_FFFF)
+}
+
+/// F3 with a 16-byte load when 16 bytes from f's start are readable (below `dend`).
+#[inline(always)]
+fn parse_f3_fast(f: &[u8], dend: usize) -> Option<i64> {
+    let n = f.len();
+    if n.wrapping_sub(1) < 16 && f.as_ptr() as usize + 16 <= dend {
+        let w = u128::from_le_bytes(unsafe { *(f.as_ptr() as *const [u8; 16]) });
+        let pad = (16 - n) as u32 * 8;
+        let fill = (1u128 << pad) - 1; // pad < 128
+        let w = (w << pad) | (0x3030_3030_3030_3030_3030_3030_3030_3030u128 & fill);
+        let hi = digits8(w as u64)?;
+        let lo = digits8((w >> 64) as u64)?;
+        return Some((hi * 100_000_000 + lo) as i64);
+    }
+    parse_f3(f)
+}
+
 /// parse_ts with a date cache.
 #[inline(always)]
-fn parse_ts_c(f: &[u8], dc: &mut DateCache) -> Option<i64> {
+fn parse_ts_c(f: &[u8], dc: &mut DateCache, dend: usize) -> Option<i64> {
     let n = f.len();
     if n == 20 && f[19] == b'Z' {
         return civil_ms_c(f, dc);
@@ -964,7 +992,7 @@ fn parse_ts_c(f: &[u8], dc: &mut DateCache) -> Option<i64> {
         let off = (oh * 60 + om) * 60_000;
         return Some(if f[19] == b'+' { base - off } else { base + off });
     }
-    parse_f3(f)
+    parse_f3_fast(f, dend)
 }
 
 /// Digits only, value 1..=10,000,000.
@@ -1322,7 +1350,7 @@ fn parse_events(data: &[u8], c: &EvCtx, out: &mut [Vec<ERec>], longs: &mut LongM
         if f[0].is_empty() {
             return;
         }
-        let Some(ingest) = parse_ts_c(f[3], &mut dc) else { return };
+        let Some(ingest) = parse_ts_c(f[3], &mut dc, dend) else { return };
         let eid = eq_key_at(f[0], dend);
         let ing_rel = (ingest.div_euclid(1000) - c.ingest_base).clamp(0, u32::MAX as i64) as u32;
         let mut rec = ERec { eid, user: 0, ingest: ing_rel, ts: INVALID, pc: 0 };
@@ -1330,7 +1358,7 @@ fn parse_events(data: &[u8], c: &EvCtx, out: &mut [Vec<ERec>], longs: &mut LongM
             if f[1].is_empty() || f[5].is_empty() {
                 break 'v;
             }
-            let Some(ts) = parse_ts_c(f[2], &mut dc) else { break 'v };
+            let Some(ts) = parse_ts_c(f[2], &mut dc, dend) else { break 'v };
             if ts < c.ws || ts >= c.we || ingest - ts > DAY_MS {
                 break 'v;
             }
@@ -1349,16 +1377,64 @@ fn parse_events(data: &[u8], c: &EvCtx, out: &mut [Vec<ERec>], longs: &mut LongM
     });
 }
 
+#[inline(always)]
+fn prefetch_ptr(p: *const i8) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p, std::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags));
+    }
+}
+
 /// Flat open-addressing map user key -> person key. Key 0 never occurs (empty slot).
 struct PersonMap {
     slots: Vec<[u64; 2]>,
     mask: usize,
     len: usize,
+    bloom: Vec<u64>, // one word per key, 2 bits: keys absent from the map skip the DRAM probe
+    bmask: usize,
 }
 impl PersonMap {
     fn with_capacity(n: usize) -> Self {
         let cap = (n * 2).next_power_of_two().max(16);
-        PersonMap { slots: vec![[0, 0]; cap], mask: cap - 1, len: 0 }
+        let words = (n * 3 / 8).next_power_of_two().max(64); // ~2.6 keys per word
+        PersonMap { slots: vec![[0, 0]; cap], mask: cap - 1, len: 0, bloom: vec![0; words], bmask: words - 1 }
+    }
+    #[inline(always)]
+    fn bloom_at(&self, k: u64) -> (usize, u64) {
+        let h = k.wrapping_mul(0xA24B_AED4_963E_E407);
+        let h = h ^ (h >> 29);
+        ((h >> 12) as usize & self.bmask, (1u64 << (h & 63)) | (1u64 << ((h >> 6) & 63)))
+    }
+    #[inline(always)]
+    fn maybe(&self, k: u64) -> bool {
+        let (i, b) = self.bloom_at(k);
+        (unsafe { *self.bloom.get_unchecked(i) } & b) == b
+    }
+    #[inline(always)]
+    fn prefetch_bloom(&self, k: u64) {
+        let p = unsafe { self.bloom.as_ptr().add(self.bloom_at(k).0) } as *const i8;
+        prefetch_ptr(p);
+    }
+    /// Maps every key of `ks` to its person in place (two stages: filter, then probe the few hits).
+    #[inline(always)]
+    fn resolve(&self, ks: &mut [u64]) {
+        let mut hit = [0u8; 64];
+        let mut nh = 0usize;
+        for (i, &k) in ks.iter().enumerate() {
+            if self.maybe(k) {
+                self.prefetch(k);
+                hit[nh] = i as u8;
+                nh += 1;
+            }
+        }
+        for &i in &hit[..nh] {
+            let k = unsafe { ks.get_unchecked_mut(i as usize) };
+            *k = self.person(*k);
+        }
     }
     #[inline(always)]
     fn slot(&self, k: u64) -> usize {
@@ -1371,6 +1447,8 @@ impl PersonMap {
             if s[0] == 0 {
                 *s = [k, v];
                 self.len += 1;
+                let (bi, bb) = self.bloom_at(k);
+                self.bloom[bi] |= bb;
                 return;
             }
             if s[0] == k {
@@ -1383,14 +1461,7 @@ impl PersonMap {
     #[inline(always)]
     fn prefetch(&self, k: u64) {
         let p = unsafe { self.slots.as_ptr().add(self.slot(k)) } as *const i8;
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            std::arch::x86_64::_mm_prefetch(p, std::arch::x86_64::_MM_HINT_T0);
-        }
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags));
-        }
+        prefetch_ptr(p);
     }
     /// Person of user `k` (itself when unlinked).
     #[inline(always)]
@@ -1458,12 +1529,17 @@ fn dedup_insert(ev_parts: &[Vec<Vec<ERec>>], b: usize, table: &mut Vec<Slot>, de
 #[inline(never)]
 fn dedup_emit(ev_parts: &[Vec<Vec<ERec>>], b: usize, dead: &[bool], pm: &PersonMap, out: &mut [Vec<SRec>]) {
     let qm = out.len() - 1;
-    const BATCH: usize = 16;
+    const BATCH: usize = 32;
     let mut buf: [(u64, u32, u32); BATCH] = [(0, 0, 0); BATCH];
     let mut n = 0usize;
     let flush = |buf: &[(u64, u32, u32)], out: &mut [Vec<SRec>]| {
-        for &(user, ts, pc) in buf {
-            let person = pm.person(user);
+        let mut ks = [0u64; BATCH];
+        for (k, b) in ks.iter_mut().zip(buf) {
+            *k = b.0;
+        }
+        let ks = &mut ks[..buf.len()];
+        pm.resolve(ks);
+        for (&person, &(_, ts, pc)) in ks.iter().zip(buf) {
             unsafe { out.get_unchecked_mut(part_of(person, qm)) }.push(SRec { person, ts, pc });
         }
     };
@@ -1475,7 +1551,7 @@ fn dedup_emit(ev_parts: &[Vec<Vec<ERec>>], b: usize, dead: &[bool], pm: &PersonM
             if d || r.ts == INVALID {
                 continue;
             }
-            pm.prefetch(r.user);
+            pm.prefetch_bloom(r.user);
             buf[n] = (r.user, r.ts, r.pc);
             n += 1;
             if n == BATCH {
@@ -1501,7 +1577,7 @@ fn parse_clicks(
 ) {
     let qm = out.len() - 1;
     let mut dc = DateCache::new();
-    const BATCH: usize = 16;
+    const BATCH: usize = 32;
     let mut buf = [CRec { person: 0, cid: 0, ts: 0, camp: 0 }; BATCH];
     let mut n = 0usize;
     let dend = data.as_ptr() as usize + data.len();
@@ -1509,13 +1585,13 @@ fn parse_clicks(
         if f[0].is_empty() || f[1].is_empty() {
             return;
         }
-        let Some(ts) = parse_ts_c(f[3], &mut dc) else { return };
+        let Some(ts) = parse_ts_c(f[3], &mut dc, dend) else { return };
         if ts < cs || ts >= we {
             return;
         }
         let Some(&camp) = campaigns.get(&eq_key_at(f[2], dend)) else { return };
         let u = eq_key_at(f[1], dend);
-        pm.prefetch(u);
+        pm.prefetch_bloom(u);
         let cid = match fast_key_at(f[0], dend) {
             Some(v) => v,
             None if f[0].len() < 4096 => {
@@ -1531,9 +1607,14 @@ fn parse_clicks(
         buf[n] = CRec { person: u, cid, ts: (ts - cs) as u32, camp };
         n += 1;
         if n == BATCH {
-            for mut r in buf {
-                r.person = pm.person(r.person);
-                unsafe { out.get_unchecked_mut(part_of(r.person, qm)) }.push(r);
+            let mut ks = [0u64; BATCH];
+            for (k, r) in ks.iter_mut().zip(&buf) {
+                *k = r.person;
+            }
+            pm.resolve(&mut ks);
+            for (mut r, &p) in buf.into_iter().zip(&ks) {
+                r.person = p;
+                unsafe { out.get_unchecked_mut(part_of(p, qm)) }.push(r);
             }
             n = 0;
         }
@@ -1794,14 +1875,14 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
                     match variant {
                         0 => scan_lines::<7>(d, |f| *sink = sink.wrapping_add(f[0].len() as u64 ^ f[6].len() as u64)),
                         1 => scan_lines::<7>(d, |f| {
-                            let a = parse_ts_c(f[2], &mut dc).unwrap_or(0) as u64;
-                            let b = parse_ts_c(f[3], &mut dc).unwrap_or(0) as u64;
+                            let a = parse_ts_c(f[2], &mut dc, dend).unwrap_or(0) as u64;
+                            let b = parse_ts_c(f[3], &mut dc, dend).unwrap_or(0) as u64;
                             *sink = sink.wrapping_add(a ^ b.rotate_left(7));
                         }),
                         2 => scan_lines::<7>(d, |f| *sink = sink.wrapping_add(eq_key_at(f[0], dend) ^ eq_key_at(f[1], dend).rotate_left(9))),
                         3 => scan_lines::<7>(d, |f| {
-                            let a = parse_ts_c(f[2], &mut dc).unwrap_or(0) as u64;
-                            let b = parse_ts_c(f[3], &mut dc).unwrap_or(0) as u64;
+                            let a = parse_ts_c(f[2], &mut dc, dend).unwrap_or(0) as u64;
+                            let b = parse_ts_c(f[3], &mut dc, dend).unwrap_or(0) as u64;
                             *sink = sink.wrapping_add(eq_key_at(f[0], dend) ^ eq_key_at(f[1], dend).rotate_left(9) ^ a ^ b.rotate_left(7));
                         }),
                         _ => parse_events(d, &ctx, &mut st.0, &mut st.2),
@@ -2612,7 +2693,7 @@ mod tests {
                 let pos = ((x >> (10 + 8 * k)) as usize) % v.len();
                 v[pos] = subst[((x >> (20 + 7 * k)) as usize) % subst.len()];
             }
-            assert_eq!(parse_ts_c(&v, &mut dc), parse_ts(&v), "{:?}", String::from_utf8_lossy(&v));
+            assert_eq!(parse_ts_c(&v, &mut dc, v.as_ptr() as usize + v.len()), parse_ts(&v), "{:?}", String::from_utf8_lossy(&v));
         }
     }
 
@@ -2768,6 +2849,36 @@ mod tests {
     }
 
     #[test]
+    fn f3_fast_matches() {
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let alpha = b"0123456789000000123456789.-+eZ ";
+        for round in 0..300_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let n = (x % 21) as usize;
+            let mut v = Vec::with_capacity(n + 16);
+            for i in 0..n {
+                let r = (x >> (i % 50)) ^ (round as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15 >> (i % 7));
+                let digit_only = round % 3 != 0;
+                let a = if digit_only { &alpha[..10] } else { &alpha[..] };
+                v.push(a[(r % a.len() as u64) as usize]);
+            }
+            let f = v.clone();
+            v.extend_from_slice(b",garbage,1234");
+            let padded = &v[..n];
+            let dend = v.as_ptr() as usize + v.len();
+            assert_eq!(parse_f3_fast(padded, dend), parse_f3(&f), "{:?}", String::from_utf8_lossy(&f));
+        }
+        for s in [&b"9999999999999999"[..], b"0000000000000000", b"1", b"0", b"1791071890000", b"0001791071890000", b"18446744073709551615", b"9223372036854775807", b"9223372036854775808"] {
+            let mut v = s.to_vec();
+            v.extend_from_slice(&[b'9'; 16]);
+            let dend = v.as_ptr() as usize + v.len();
+            assert_eq!(parse_f3_fast(&v[..s.len()], dend), parse_f3(s));
+        }
+    }
+
+    #[test]
     fn cached_ts_matches() {
         let mut dc = DateCache::new();
         let cases: Vec<&[u8]> = vec![
@@ -2783,7 +2894,7 @@ mod tests {
         ];
         for _ in 0..3 {
             for c in &cases {
-                assert_eq!(parse_ts_c(c, &mut dc), parse_ts(c), "{:?}", String::from_utf8_lossy(c));
+                assert_eq!(parse_ts_c(c, &mut dc, c.as_ptr() as usize + c.len()), parse_ts(c), "{:?}", String::from_utf8_lossy(c));
             }
         }
     }
