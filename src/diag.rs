@@ -129,8 +129,8 @@ pub fn bench_parse(data: &Path) {
                                     if variant == 0 {
                                         sink += f[0].len() as u64;
                                     } else {
-                                        let k = crate::key(f[0]);
-                                        let u = crate::key(f[1]);
+                                        let k = crate::eq_key(f[0]);
+                                        let u = crate::eq_key(f[1]);
                                         let ts = crate::parse_ts(f[2]).unwrap_or(0) as u64;
                                         let ing = crate::parse_ts(f[3]).unwrap_or(0) as u64;
                                         if variant == 1 {
