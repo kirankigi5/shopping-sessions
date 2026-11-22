@@ -208,17 +208,16 @@ fn long_key(s: &[u8], longs: &mut LongMap) -> u64 {
 }
 
 /// Bytes of a click id key (fast, file location, or LongMap).
-fn cid_bytes(k: u64, files: &[Option<Buf>], longs: &Longs) -> Vec<u8> {
-    if k & SLOW == 0 {
-        return key_bytes(k, longs);
-    }
+/// Bytes of a long click id (file location or LongMap). Short ids are decoded by the caller.
+#[inline(always)]
+fn cid_long<'a>(k: u64, files: &'a [Option<Buf>], longs: &'a Longs) -> &'a [u8] {
     let file = ((k >> 52) & 0x3FF) as usize;
     if file == 0x3FF {
-        return longs.get(k).to_vec();
+        return longs.get(k);
     }
     let off = ((k >> 12) & ((1 << 40) - 1)) as usize;
     let len = (k & 0xFFF) as usize;
-    files[file].as_ref().unwrap()[off..off + len].to_vec()
+    &files[file].as_ref().unwrap()[off..off + len]
 }
 
 #[inline(always)]
@@ -226,7 +225,10 @@ fn cid_cmp(a: u64, b: u64, files: &[Option<Buf>], longs: &Longs) -> std::cmp::Or
     if (a | b) & SLOW == 0 {
         a.cmp(&b)
     } else {
-        cid_bytes(a, files, longs).cmp(&cid_bytes(b, files, longs))
+        let (mut ba, mut bb) = ([0u8; KEY_LEN], [0u8; KEY_LEN]);
+        let sa: &[u8] = if a & SLOW != 0 { cid_long(a, files, longs) } else { let n = short_bytes(a, &mut ba); &ba[..n] };
+        let sb: &[u8] = if b & SLOW != 0 { cid_long(b, files, longs) } else { let n = short_bytes(b, &mut bb); &bb[..n] };
+        sa.cmp(sb)
     }
 }
 
@@ -1591,8 +1593,9 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
             let n_ev: usize = mids.iter().map(|m| m.ev[q].len()).sum();
             let n_ck: usize = mids.iter().map(|m| m.ck[q].len()).sum();
             // local dense person ids
-            let cap = (n_ev * 2).next_power_of_two().max(64);
-            let mask = cap - 1;
+            // table sized for distinct people (grows at 50% load), not for events
+            let mut cap = (n_ev / 8).next_power_of_two().max(256);
+            let mut mask = cap - 1;
             st.lslots.clear();
             st.lslots.resize(cap, (0, 0));
             st.lkeys.clear();
@@ -1618,6 +1621,19 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
                     };
                     st.lcount[lid as usize] += 1;
                     st.lids.push(lid);
+                    if st.lkeys.len() * 2 > cap {
+                        cap *= 2;
+                        mask = cap - 1;
+                        st.lslots.clear();
+                        st.lslots.resize(cap, (0, 0));
+                        for (l, &k) in st.lkeys.iter().enumerate() {
+                            let mut h = (mix(k) as usize) & mask;
+                            while st.lslots[h].0 != 0 {
+                                h = (h + 1) & mask;
+                            }
+                            st.lslots[h] = (k, l as u32);
+                        }
+                    }
                 }
             }
             let np = st.lkeys.len();
@@ -1932,7 +1948,34 @@ fn write_user_daily(path: &Path, rows: &[URow], cats: &[Vec<u8>], longs: &Longs)
         while let Some(mut c) = rg.next_column().unwrap() {
             match col {
                 0 => {
-                    let v: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(key_bytes(r.person, longs))).collect();
+                    let mut buf: Vec<u8> = Vec::with_capacity(rows.len() * 12);
+                    let mut ends: Vec<u32> = Vec::with_capacity(rows.len());
+                    let mut last = u64::MAX;
+                    let mut sb = [0u8; KEY_LEN];
+                    for r in rows {
+                        if r.person != last {
+                            if r.person & SLOW != 0 {
+                                buf.extend_from_slice(longs.get(r.person));
+                            } else {
+                                let n = short_bytes(r.person, &mut sb);
+                                buf.extend_from_slice(&sb[..n]);
+                            }
+                            last = r.person;
+                        }
+                        ends.push(buf.len() as u32);
+                    }
+                    let all = bytes::Bytes::from(buf);
+                    let mut v: Vec<ByteArray> = Vec::with_capacity(rows.len());
+                    let mut start = 0usize;
+                    let mut prev_end = u32::MAX;
+                    for &e in &ends {
+                        if e != prev_end {
+                            // new person: its bytes end at e; they start where the previous person ended
+                            start = if prev_end == u32::MAX { 0 } else { prev_end as usize };
+                            prev_end = e;
+                        }
+                        v.push(ByteArray::from(all.slice(start..e as usize)));
+                    }
                     c.typed::<ByteArrayType>().write_batch(&v, None, None).unwrap();
                 }
                 1 => {
