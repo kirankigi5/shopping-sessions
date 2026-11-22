@@ -1148,6 +1148,24 @@ fn parse_ts_c(f: &[u8], dc: &mut DateCache, dend: usize) -> Option<i64> {
     parse_f3_fast(f, dend)
 }
 
+/// (is view|cart|purchase, is purchase), exactly as comparing the slice with the three words.
+#[inline(always)]
+fn event_type(ty: &[u8], dend: usize) -> (bool, bool) {
+    let n = ty.len();
+    if ty.as_ptr() as usize + 8 <= dend {
+        let w = u64::from_le_bytes(unsafe { *(ty.as_ptr() as *const [u8; 8]) });
+        let w4 = w as u32;
+        let four = (n == 4) as u8;
+        let v = four & (w4 == u32::from_le_bytes(*b"view")) as u8;
+        let c = four & (w4 == u32::from_le_bytes(*b"cart")) as u8;
+        let p = (n == 8) as u8 & (w == u64::from_le_bytes(*b"purchase")) as u8;
+        ((v | c | p) != 0, p != 0)
+    } else {
+        let p = ty == b"purchase";
+        (p || ty == b"view" || ty == b"cart", p)
+    }
+}
+
 /// Digits only, value 1..=10,000,000.
 #[inline(always)]
 fn parse_price(f: &[u8]) -> Option<u32> {
@@ -1607,13 +1625,16 @@ fn parse_events(data: &[u8], c: &EvCtx, out: &mut NtBuckets<ERec, 2>, longs: &mu
             if ts < c.ws || ts >= c.we || ingest - ts > DAY_MS {
                 break 'v;
             }
-            let ty = f[4];
-            if ty == b"purchase" {
+            // event type without a compare chain: view/cart/purchase are randomly mixed, so the old
+            // chain of slice compares mispredicted; classify with one word compare per type
+            let (is_ok, is_purch) = event_type(f[4], dend);
+            if !is_ok {
+                break 'v;
+            }
+            if is_purch {
                 let Some(p) = parse_price(f[6]) else { break 'v };
                 let cat = *c.products.get(&eq_key_at(f[5], dend)).unwrap_or(&c.unknown_cat);
                 rec.pc = p << 8 | cat;
-            } else if ty != b"view" && ty != b"cart" {
-                break 'v;
             }
             rec.user = match fast_key_at(f[1], dend) {
                 Some(v) => v,
@@ -3236,6 +3257,22 @@ mod tests {
             v.extend_from_slice(&[b'9'; 16]);
             let dend = v.as_ptr() as usize + v.len();
             assert_eq!(parse_f3_fast(&v[..s.len()], dend), parse_f3(s));
+        }
+    }
+
+    #[test]
+    fn event_type_matches() {
+        let words: Vec<&[u8]> = vec![b"view", b"cart", b"purchase", b"View", b"cart ", b"purchas", b"purchasee", b"", b"vie", b"Purchase", b"viewx", b" view", b"carts"];
+        for w in &words {
+            let want_p = *w == b"purchase";
+            let want = want_p || *w == b"view" || *w == b"cart";
+            let mut buf = w.to_vec();
+            buf.extend_from_slice(b",p123,450,more");
+            let dend = buf.as_ptr() as usize + buf.len();
+            assert_eq!(event_type(&buf[..w.len()], dend), (want, want_p), "{:?}", String::from_utf8_lossy(w));
+            let tight = w.to_vec();
+            let dend2 = tight.as_ptr() as usize + tight.len();
+            assert_eq!(event_type(&tight[..], dend2), (want, want_p));
         }
     }
 
