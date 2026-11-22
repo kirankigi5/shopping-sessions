@@ -3,44 +3,54 @@ on:
   push:
     branches: [bench]
   workflow_dispatch:
+env:
+  BASE: fast4
 jobs:
   bench:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: machine
-        run: |
-          lscpu | head -25; nproc; free -g
-          cat /sys/kernel/mm/transparent_hugepage/enabled /sys/kernel/mm/transparent_hugepage/defrag; uname -r
+        run: lscpu | grep -E "Model name|^CPU\(s\)"
       - name: tools
         run: |
-          sudo apt-get update -qq >/dev/null
-          sudo apt-get install -y -qq linux-tools-common linux-tools-$(uname -r) >/dev/null 2>&1 || sudo apt-get install -y -qq linux-tools-generic >/dev/null 2>&1 || true
-          sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
-          (ls /usr/lib/linux-tools/*/perf; which perf) || true
+          sudo apt-get install -y -qq linux-tools-common linux-tools-$(uname -r) >/dev/null 2>&1 || true
+          sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0 >/dev/null
       - name: build
         run: |
-          rustc --version
-          RUSTFLAGS="-C target-cpu=x86-64-v3 -C force-frame-pointers=yes" CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build --release --locked -q
+          export RUSTFLAGS="-C target-cpu=x86-64-v3 -C force-frame-pointers=yes" CARGO_PROFILE_RELEASE_DEBUG=line-tables-only
+          cargo build --release --locked -q && cp target/release/solution /tmp/new
+          git worktree add -q /tmp/base origin/$BASE && (cd /tmp/base && cargo build --release --locked -q --target-dir /tmp/tb) && cp /tmp/tb/release/solution /tmp/base.bin
           (cd gen && cargo build --release -q)
       - name: generate 20M into tmpfs
+        run: gen/target/release/generate --seed 7 --events 20000000 --clicks 5000000 --output /dev/shm/d >/dev/null
+      - name: correctness (new vs base output)
         run: |
-          gen/target/release/generate --seed 7 --events 20000000 --clicks 5000000 --output /dev/shm/d >/dev/null
-          du -sh /dev/shm/d
-      - name: timing
+          rm -rf /tmp/oa /tmp/ob; mkdir /tmp/oa /tmp/ob
+          DATA_DIR=/dev/shm/d OUTPUT_DIR=/tmp/oa /tmp/base.bin 2>/dev/null; DATA_DIR=/dev/shm/d OUTPUT_DIR=/tmp/ob /tmp/new 2>/dev/null
+          pip install -q pyarrow >/dev/null 2>&1
+          python3 -c "
+          import pyarrow.parquet as pq, sys
+          for t in ['user_daily','campaign_daily']:
+              a=pq.read_table('/tmp/oa/'+t).to_pandas(); b=pq.read_table('/tmp/ob/'+t).to_pandas()
+              cols=sorted(a.columns); a=a[cols].sort_values(cols).reset_index(drop=True); b=b[cols].sort_values(cols).reset_index(drop=True)
+              print(t, 'MATCH' if a.astype(str).equals(b.astype(str)) else 'DIFF', len(a), len(b))
+          "
+      - name: A/B timing
         run: |
-          B=target/release/solution
-          for t in 4 4 4 1; do rm -rf /tmp/o; mkdir /tmp/o; /usr/bin/time -f "wall=%e user=%U sys=%S maxrss=%MKB" env NCPU=$t DATA_DIR=/dev/shm/d OUTPUT_DIR=/tmp/o $B; done 2>&1
-          SS_READ=1 BENCH_PARSE=1 BENCH_THREADS=1 DATA_DIR=/dev/shm/d OUTPUT_DIR=/tmp/o $B 2>&1 | tail -1
-      - name: perf
+          for r in 1 2 3 4 5 6; do for b in base.bin new; do rm -rf /tmp/o; mkdir /tmp/o
+            s=$(date +%s%N); NCPU=4 DATA_DIR=/dev/shm/d OUTPUT_DIR=/tmp/o /tmp/$b 2>/dev/null; e=$(date +%s%N)
+            echo "$b $(( (e-s)/1000000 ))" >> /tmp/ab.txt; done; done
+          python3 -c "
+          import collections; d=collections.defaultdict(list)
+          for l in open('/tmp/ab.txt'): n,v=l.split(); d[n].append(int(v))
+          for n,v in d.items(): print(f'{n:9s} min {min(v)} med {sorted(v)[len(v)//2]} all {v}')
+          "
+      - name: perf (new)
         run: |
-          P=$( (ls /usr/lib/linux-tools/*/perf 2>/dev/null; which perf) | head -1 ); echo "perf=$P"
-          B=target/release/solution
           rm -rf /tmp/o; mkdir /tmp/o
-          $P stat -e cycles,instructions,branches,branch-misses,cache-references,cache-misses,L1-dcache-load-misses,dTLB-load-misses,dTLB-store-misses env NCPU=4 DATA_DIR=/dev/shm/d OUTPUT_DIR=/tmp/o $B 2>&1 | tail -25 || true
-          rm -rf /tmp/o; mkdir /tmp/o
-          $P record -F 999 -o /tmp/perf.data env NCPU=4 DATA_DIR=/dev/shm/d OUTPUT_DIR=/tmp/o $B 2>&1 | tail -3 || true
-          $P report -i /tmp/perf.data --stdio --no-children --sort sym 2>/dev/null | grep -v '^#' | grep -v '^$' | head -45 || true
-          for s in parse_events dedup_emit; do echo "=== hottest lines in $s"; $P annotate -i /tmp/perf.data --stdio -l -s $(nm -C $B | grep -m1 " solution::$s\b" | awk '{print $3}') 2>/dev/null | grep -E '^ +[0-9]+\.[0-9]+ ' | sort -rn | head -30; done || true
-          $P report -i /tmp/perf.data --stdio --no-children --sort srcline 2>/dev/null | grep -v '^#' | grep -v '^$' | head -60 || true
+          perf record -F 999 -o /tmp/perf.data env NCPU=4 DATA_DIR=/dev/shm/d OUTPUT_DIR=/tmp/o /tmp/new 2>&1 | tail -1
+          perf report -i /tmp/perf.data --stdio --no-children --sort sym 2>/dev/null | grep -v '^#' | grep -v '^$' | head -30 | cut -c1-140

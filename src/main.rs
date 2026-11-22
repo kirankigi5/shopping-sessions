@@ -870,22 +870,27 @@ fn parse_f3(f: &[u8]) -> Option<i64> {
 
 /// Per-thread cache of "YYYY-MM-DD" -> epoch ms of that midnight (or invalid).
 struct DateCache {
-    keys: [u64; 64],
-    vals: [i64; 64],
+    keys: Box<[u64; DC_SLOTS]>,
+    vals: Box<[i64; DC_SLOTS]>,
 }
+/// Slot = (month code) * 40 + (day code) from the digit nibbles: distinct valid dates never share
+/// a slot (the old 64-slot hash made dates of one window collide and evict each other).
+const DC_SLOTS: usize = 1024;
 const BAD_DATE: i64 = i64::MIN;
 impl DateCache {
     fn new() -> Self {
-        DateCache { keys: [u64::MAX; 64], vals: [0; 64] }
+        DateCache { keys: Box::new([u64::MAX; DC_SLOTS]), vals: Box::new([0; DC_SLOTS]) }
     }
     #[inline(always)]
     fn day_ms(&mut self, f: &[u8]) -> i64 {
         // f has at least 19 bytes; f[4] and f[7] are checked to be '-'
         let k1 = u64::from_le_bytes(f[0..8].try_into().unwrap());
         let k = (k1 & 0x00FF_FF00_FFFF_FFFF) | ((f[8] as u64) << 32) | ((f[9] as u64) << 56);
-        let i = (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize;
-        if self.keys[i] == k {
-            return self.vals[i];
+        let m = ((f[5] & 1) as usize) * 10 + (f[6] & 0xF) as usize; // 0..=25
+        let d = ((f[8] & 3) as usize) * 10 + (f[9] & 0xF) as usize; // 0..=45
+        let i = (m * 40 + d) & (DC_SLOTS - 1);
+        if unsafe { *self.keys.get_unchecked(i) } == k {
+            return unsafe { *self.vals.get_unchecked(i) };
         }
         let v = date_ms_slow(f);
         self.keys[i] = k;
