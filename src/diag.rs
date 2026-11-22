@@ -101,6 +101,64 @@ fn mmap_all_parallel(paths: &[PathBuf], threads: usize) -> (f64, u64) {
     (t.elapsed().as_secs_f64(), total)
 }
 
+/// Tokenize-only and scatter microbenchmarks on in-memory copies of the event files.
+pub fn bench_parse(data: &Path) {
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(data.join("events")).unwrap().flatten().map(|e| e.path()).collect();
+    paths.sort();
+    let bufs: Vec<Vec<u8>> = paths.iter().map(|p| std::fs::read(p).unwrap()).collect();
+    let lines: usize = bufs.iter().map(|b| memchr::memchr_iter(b'\n', b).count()).sum();
+    eprintln!("bench: {} files, {} lines, avx2 path={}", bufs.len(), lines, cfg!(target_feature = "avx2"));
+    for th in [1usize, 8] {
+        for variant in 0..4 {
+            let t = Instant::now();
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            std::thread::scope(|sc| {
+                for _ in 0..th {
+                    sc.spawn(|| {
+                        let fan = [1usize, 1, 64, 1024][variant];
+                        let mut out: Vec<Vec<[u64; 4]>> = (0..fan).map(|_| Vec::with_capacity(lines / th / fan + 64)).collect();
+                        let mut sink = 0u64;
+                        for _rep in 0..3 {
+                            loop {
+                                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if i >= bufs.len() * 3 {
+                                    break;
+                                }
+                                let b = &bufs[i % bufs.len()];
+                                crate::scan_lines::<7>(b, |f| {
+                                    if variant == 0 {
+                                        sink += f[0].len() as u64;
+                                    } else {
+                                        let k = crate::key(f[0]);
+                                        let u = crate::key(f[1]);
+                                        let ts = crate::parse_ts(f[2]).unwrap_or(0) as u64;
+                                        let ing = crate::parse_ts(f[3]).unwrap_or(0) as u64;
+                                        if variant == 1 {
+                                            sink = sink.wrapping_add(k ^ u ^ ts ^ ing);
+                                        } else {
+                                            out[crate::part_of(k, fan - 1)].push([k, u, ts, ing]);
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                        std::hint::black_box(sink);
+                        std::hint::black_box(&out);
+                    });
+                }
+            });
+            let el = t.elapsed().as_secs_f64();
+            eprintln!(
+                "bench threads={} variant={} ({}): {:.1} ns/line/thread",
+                th,
+                variant,
+                ["tokenize", "parse", "parse+64buckets", "parse+1024buckets"][variant],
+                el * 1e9 * th as f64 / (lines * 3) as f64
+            );
+        }
+    }
+}
+
 pub fn run(data: &Path) {
     let t0 = Instant::now();
     eprintln!("=== DIAG ===");
