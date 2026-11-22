@@ -822,10 +822,18 @@ const NO_CAT: u16 = u16::MAX;
 static COMPACT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static LOGBUF: Mutex<String> = Mutex::new(String::new());
 
+fn cpu_times() -> (f64, f64) {
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
+    let t = |tv: libc::timeval| tv.tv_sec as f64 + tv.tv_usec as f64 / 1e6;
+    (t(ru.ru_utime), t(ru.ru_stime))
+}
+
 fn log(start: &Instant, msg: &str) {
     if COMPACT.load(Ordering::Relaxed) {
-        let word = msg.split(|c: char| c == ' ' || c == ':' || c == '(').next().unwrap_or("");
-        LOGBUF.lock().unwrap().push_str(&format!(" {}={:.0}", word, start.elapsed().as_secs_f64() * 1000.0));
+        let word: String = msg.split(|c: char| c == ':' || c == '(' || c == ';').next().unwrap_or("").replace(' ', "_");
+        let (u, sy) = cpu_times();
+        LOGBUF.lock().unwrap().push_str(&format!(" {}={:.0}[u{:.0},s{:.0}]", word, start.elapsed().as_secs_f64() * 1000.0, u * 1000.0, sy * 1000.0));
     } else {
         eprintln!("[{:7.3}s] {}", start.elapsed().as_secs_f64(), msg);
     }
@@ -1160,6 +1168,41 @@ fn main() {
     #[cfg(feature = "diag")]
     {
         COMPACT.store(true, Ordering::Relaxed);
+        let scratch = PathBuf::from(std::env::var("SCRATCH_DIR").unwrap_or_else(|_| "/scratch".into()));
+        let gen_dir = scratch.join("gen20");
+        let generator = std::env::var("SS_GENERATOR").unwrap_or_else(|_| "/app/generate".into());
+        if Path::new(&generator).exists() {
+            let t = Instant::now();
+            let st = std::process::Command::new(&generator)
+                .args(["--seed", "7", "--events", "20000000", "--clicks", "5000000", "--output"])
+                .arg(&gen_dir)
+                .stdout(std::process::Stdio::null())
+                .status();
+            eprintln!("generate 20M: {:?} in {:.2}s", st, t.elapsed().as_secs_f64());
+            let big_out = scratch.join("out20");
+            let big = [
+                Cfg { threads, read: false, p: 1024, q: 1024 },
+                Cfg { threads, read: false, p: 1024, q: 1024 },
+                Cfg { threads, read: false, p: 1024, q: 1024 },
+                Cfg { threads, read: false, p: 256, q: 256 },
+                Cfg { threads, read: false, p: 4096, q: 4096 },
+                Cfg { threads: 4, read: false, p: 1024, q: 1024 },
+                Cfg { threads: 12, read: false, p: 1024, q: 1024 },
+                Cfg { threads: 1, read: false, p: 1024, q: 1024 },
+                Cfg { threads, read: true, p: 1024, q: 1024 },
+            ];
+            for c in &big {
+                let _ = std::fs::remove_dir_all(&big_out);
+                std::fs::create_dir_all(&big_out).unwrap();
+                let (u0, s0) = cpu_times();
+                pipeline(c, &gen_dir, &big_out);
+                let (u1, s1) = cpu_times();
+                let line = std::mem::take(&mut *LOGBUF.lock().unwrap());
+                eprintln!("BIG t={} read={} p={} cpu u={:.2} s={:.2}:{}", c.threads, c.read as u8, c.p, u1 - u0, s1 - s0, line);
+            }
+        } else {
+            eprintln!("no generator at {}", generator);
+        }
         let configs = [
             Cfg { threads, read: false, p: 1024, q: 1024 },
             Cfg { threads, read: true, p: 1024, q: 1024 },
