@@ -115,6 +115,30 @@ fn hash_bytes(s: &[u8]) -> u64 {
     mix(h)
 }
 
+/// Branch-free fast_key: reads 10 bytes starting at s.as_ptr() (caller guarantees they are
+/// readable), encodes all of them and masks positions >= len.
+#[inline(always)]
+unsafe fn fast_key_win(s: &[u8]) -> Option<u64> {
+    let n = s.len();
+    if n.wrapping_sub(1) >= KEY_LEN {
+        return None;
+    }
+    let p = s.as_ptr();
+    let mut v = 0u64;
+    let mut bad = 0u32;
+    for i in 0..KEY_LEN {
+        let c = ENC[unsafe { *p.add(i) } as usize];
+        bad |= ((c >> 7) as u32) << i;
+        v |= ((c & 0x3F) as u64) << (6 * (KEY_LEN - 1 - i));
+    }
+    let keep_bits = 6 * n as u32; // top bits that belong to the key
+    let v = v & !(u64::MAX >> (64 - 6 * KEY_LEN as u32) >> keep_bits) & ((1u64 << (6 * KEY_LEN)) - 1);
+    if bad & ((1u32 << n) - 1) != 0 {
+        return None;
+    }
+    Some(v)
+}
+
 #[inline(always)]
 fn fast_key(s: &[u8]) -> Option<u64> {
     let n = s.len();
@@ -131,6 +155,28 @@ fn fast_key(s: &[u8]) -> Option<u64> {
         }
     }
     None
+}
+
+/// fast_key using the windowed encoder when 10 bytes from the field start lie before `end`.
+#[inline(always)]
+fn fast_key_at(s: &[u8], end: usize) -> Option<u64> {
+    if s.as_ptr() as usize + KEY_LEN <= end { unsafe { fast_key_win(s) } } else { fast_key(s) }
+}
+
+#[inline(always)]
+fn eq_key_at(s: &[u8], end: usize) -> u64 {
+    match fast_key_at(s, end) {
+        Some(v) => v,
+        None => SLOW | (hash_bytes(s) >> 1),
+    }
+}
+
+#[inline(always)]
+fn key_at(s: &[u8], end: usize, longs: &mut LongMap) -> u64 {
+    match fast_key_at(s, end) {
+        Some(v) => v,
+        None => long_key(s, longs),
+    }
 }
 
 /// Equality-only key: short IDs encode exactly, others become SLOW | 63-bit hash.
@@ -209,6 +255,21 @@ fn key_bytes(k: u64, longs: &Longs) -> Vec<u8> {
     }
 }
 
+/// Decodes a short key into `buf`, returning its length.
+#[inline(always)]
+fn short_bytes(k: u64, buf: &mut [u8; KEY_LEN]) -> usize {
+    let mut n = 0;
+    for i in 0..KEY_LEN {
+        let c = ((k >> (6 * (KEY_LEN - 1 - i))) & 0x3F) as usize;
+        if c == 0 {
+            break;
+        }
+        buf[i] = DEC[c];
+        n += 1;
+    }
+    n
+}
+
 #[inline(always)]
 fn key_cmp(a: u64, b: u64, longs: &Longs) -> std::cmp::Ordering {
     if (a | b) & SLOW == 0 {
@@ -216,7 +277,10 @@ fn key_cmp(a: u64, b: u64, longs: &Longs) -> std::cmp::Ordering {
     } else if a == b {
         std::cmp::Ordering::Equal
     } else {
-        key_bytes(a, longs).cmp(&key_bytes(b, longs))
+        let (mut ba, mut bb) = ([0u8; KEY_LEN], [0u8; KEY_LEN]);
+        let sa: &[u8] = if a & SLOW != 0 { longs.get(a) } else { let n = short_bytes(a, &mut ba); &ba[..n] };
+        let sb: &[u8] = if b & SLOW != 0 { longs.get(b) } else { let n = short_bytes(b, &mut bb); &bb[..n] };
+        sa.cmp(sb)
     }
 }
 
@@ -973,12 +1037,13 @@ struct EvCtx<'a> {
 fn parse_events(data: &[u8], c: &EvCtx, out: &mut [Vec<ERec>], longs: &mut LongMap) {
     let mask = out.len() - 1;
     let mut dc = DateCache::new();
+    let dend = data.as_ptr() as usize + data.len();
     scan_lines::<7>(data, |f| {
         if f[0].is_empty() {
             return;
         }
         let Some(ingest) = parse_ts_c(f[3], &mut dc) else { return };
-        let eid = eq_key(f[0]);
+        let eid = eq_key_at(f[0], dend);
         let ing_rel = (ingest.div_euclid(1000) - c.ingest_base).clamp(0, u32::MAX as i64) as u32;
         let mut rec = ERec { eid, user: 0, ingest: ing_rel, ts: INVALID, pc: 0 };
         'v: {
@@ -992,12 +1057,12 @@ fn parse_events(data: &[u8], c: &EvCtx, out: &mut [Vec<ERec>], longs: &mut LongM
             let ty = f[4];
             if ty == b"purchase" {
                 let Some(p) = parse_price(f[6]) else { break 'v };
-                let cat = *c.products.get(&eq_key(f[5])).unwrap_or(&c.unknown_cat);
+                let cat = *c.products.get(&eq_key_at(f[5], dend)).unwrap_or(&c.unknown_cat);
                 rec.pc = p << 8 | cat;
             } else if ty != b"view" && ty != b"cart" {
                 break 'v;
             }
-            rec.user = key(f[1], longs);
+            rec.user = key_at(f[1], dend, longs);
             rec.ts = (ts - c.ws) as u32;
         }
         out[part_of(eid, mask)].push(rec);
@@ -1145,6 +1210,7 @@ fn parse_clicks(
     const BATCH: usize = 16;
     let mut buf = [CRec { person: 0, cid: 0, ts: 0, camp: 0 }; BATCH];
     let mut n = 0usize;
+    let dend = data.as_ptr() as usize + data.len();
     scan_lines::<4>(data, |f| {
         if f[0].is_empty() || f[1].is_empty() {
             return;
@@ -1153,10 +1219,10 @@ fn parse_clicks(
         if ts < cs || ts >= we {
             return;
         }
-        let Some(&camp) = campaigns.get(&eq_key(f[2])) else { return };
-        let u = eq_key(f[1]);
+        let Some(&camp) = campaigns.get(&eq_key_at(f[2], dend)) else { return };
+        let u = eq_key_at(f[1], dend);
         pm.prefetch(u);
-        let cid = match fast_key(f[0]) {
+        let cid = match fast_key_at(f[0], dend) {
             Some(v) => v,
             None if f[0].len() < 4096 => {
                 let off = f[0].as_ptr() as usize - base as usize;
@@ -1337,6 +1403,8 @@ fn main() {
     }
     #[allow(unreachable_code)]
     pipeline(&cfg, &data_dir, &out_dir);
+    // skip freeing GBs of buffers and unmapping inputs; outputs are already closed
+    std::process::exit(0);
 }
 
 fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
@@ -1484,7 +1552,7 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
         },
     );
 
-    drop(ev_parts);
+    std::mem::forget(ev_parts);
     let mut mids = mids;
     for m in mids.iter_mut() {
         long_maps.push(std::mem::take(&mut m.longs));
@@ -1642,7 +1710,8 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
             st.cks = cks;
         },
     );
-    drop(mids);
+    let mids = std::mem::ManuallyDrop::new(mids);
+    let _ = &mids;
     log(&t0, "sessions built");
 
     // ---- campaign_daily: merge
@@ -1671,6 +1740,16 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
         sc.spawn(move || write_campaign_daily(&path, camp, ndays, day0, camp_ids, camp_channels));
     });
     log(&t0, "done");
+    if !cfg!(feature = "diag") {
+        std::mem::forget(states);
+        std::mem::forget(long_maps);
+        std::mem::forget(ev_maps);
+        std::mem::forget(ck_maps);
+        std::mem::forget(lk_maps);
+        std::mem::forget(person_map);
+    } else {
+        drop(std::mem::ManuallyDrop::into_inner(mids));
+    }
 }
 
 struct St {
@@ -1946,6 +2025,24 @@ fn write_campaign_daily(path: &Path, camp: &[[i64; 4]], ndays: usize, day0: i64,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fast_key_win_matches() {
+        let mut x: u64 = 77;
+        let alpha = b"abz09_AZ ,\"\r\xff\x00m";
+        for _ in 0..200000 {
+            let mut buf = [0u8; 24];
+            for b in buf.iter_mut() {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                *b = if x & 1 == 0 { b"abcdefghijklmnopqrstuvwxyz0123456789_"[(x >> 8) as usize % 37] } else { alpha[(x >> 8) as usize % alpha.len()] };
+            }
+            let n = (x >> 30) as usize % 14;
+            let f = &buf[..n];
+            assert_eq!(unsafe { fast_key_win(f) }, fast_key(f), "{:?}", f);
+        }
+    }
 
     #[test]
     fn scan_unterminated() {
