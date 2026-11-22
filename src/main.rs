@@ -36,10 +36,7 @@ impl Hasher for FastHasher {
         self.0
     }
     fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 = (self.0 ^ b as u64).wrapping_mul(0x0100_0000_01b3);
-        }
-        self.0 = mix(self.0);
+        self.0 = mix(hash_bytes(bytes).rotate_left(23) ^ self.0);
     }
     #[inline(always)]
     fn write_u64(&mut self, v: u64) {
@@ -100,18 +97,39 @@ const fn build_dec() -> [u8; 38] {
 }
 static DEC: [u8; 38] = build_dec();
 const SLOW: u64 = 1 << 63;
+const SHARD_BITS: u32 = 8;
+const SHARDS: usize = 1 << SHARD_BITS;
+const IDX_BITS: u32 = 63 - SHARD_BITS;
 
-struct Interned {
-    map: HashMap<Vec<u8>, u32>,
-    vec: Vec<Vec<u8>>,
+#[inline(always)]
+fn hash_bytes(s: &[u8]) -> u64 {
+    let mut h: u64 = 0x243F_6A88_85A3_08D3 ^ s.len() as u64;
+    let mut c = s.chunks_exact(8);
+    for w in &mut c {
+        h = (h ^ u64::from_le_bytes(w.try_into().unwrap())).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        h ^= h >> 29;
+    }
+    let r = c.remainder();
+    if !r.is_empty() {
+        let mut b = [0u8; 8];
+        b[..r.len()].copy_from_slice(r);
+        h = (h ^ u64::from_le_bytes(b)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    mix(h)
 }
-static INTERN: OnceLock<Mutex<Interned>> = OnceLock::new();
-fn interned() -> &'static Mutex<Interned> {
-    INTERN.get_or_init(|| Mutex::new(Interned { map: HashMap::new(), vec: Vec::new() }))
+
+#[derive(Default)]
+struct Shard {
+    map: HashMap<Box<[u8]>, u32, BuildHasherDefault<FastHasher>>,
+    vec: Vec<Box<[u8]>>,
+}
+static SHARD_TABLE: OnceLock<Vec<Mutex<Shard>>> = OnceLock::new();
+fn shards() -> &'static [Mutex<Shard>] {
+    SHARD_TABLE.get_or_init(|| (0..SHARDS).map(|_| Mutex::new(Shard::default())).collect())
 }
 
 #[inline(always)]
-fn key(s: &[u8]) -> u64 {
+fn fast_key(s: &[u8]) -> Option<u64> {
     let n = s.len();
     if n >= 1 && n <= KEY_LEN {
         let mut v = 0u64;
@@ -122,31 +140,53 @@ fn key(s: &[u8]) -> u64 {
             v |= ((c & 0x3F) as u64) << (6 * (KEY_LEN - 1 - i));
         }
         if flags & 0x80 == 0 {
-            return v;
+            return Some(v);
         }
     }
-    slow_key(s)
+    None
 }
 
-#[cold]
+/// Exact, order-preserving key (see key_cmp).
+#[inline(always)]
+fn key(s: &[u8]) -> u64 {
+    match fast_key(s) {
+        Some(v) => v,
+        None => slow_key(s),
+    }
+}
+
+/// Equality-only key: long strings get a 63-bit hash instead of being interned.
+#[inline(always)]
+fn eq_key(s: &[u8]) -> u64 {
+    match fast_key(s) {
+        Some(v) => v,
+        None => SLOW | (hash_bytes(s) >> 1),
+    }
+}
+
 #[inline(never)]
 fn slow_key(s: &[u8]) -> u64 {
-    let mut t = interned().lock().unwrap();
+    let h = hash_bytes(s);
+    let sh = (h >> (64 - SHARD_BITS)) as usize;
+    let mut t = shards()[sh].lock().unwrap();
     let idx = match t.map.get(s) {
         Some(&i) => i,
         None => {
             let i = t.vec.len() as u32;
-            t.vec.push(s.to_vec());
-            t.map.insert(s.to_vec(), i);
+            let b: Box<[u8]> = s.into();
+            t.vec.push(b.clone());
+            t.map.insert(b, i);
             i
         }
     };
-    SLOW | idx as u64
+    SLOW | ((sh as u64) << IDX_BITS) | idx as u64
 }
 
 fn key_bytes(k: u64) -> Vec<u8> {
     if k & SLOW != 0 {
-        interned().lock().unwrap().vec[(k & !SLOW) as usize].clone()
+        let sh = ((k & !SLOW) >> IDX_BITS) as usize;
+        let idx = (k & ((1u64 << IDX_BITS) - 1)) as usize;
+        shards()[sh].lock().unwrap().vec[idx].to_vec()
     } else {
         (0..KEY_LEN)
             .map(|i| ((k >> (6 * (KEY_LEN - 1 - i))) & 0x3F) as usize)
@@ -160,6 +200,8 @@ fn key_bytes(k: u64) -> Vec<u8> {
 fn key_cmp(a: u64, b: u64) -> std::cmp::Ordering {
     if (a | b) & SLOW == 0 {
         a.cmp(&b)
+    } else if a == b {
+        std::cmp::Ordering::Equal
     } else {
         key_bytes(a).cmp(&key_bytes(b))
     }
@@ -660,7 +702,7 @@ fn parse_events(data: &[u8], c: &EvCtx, out: &mut [Vec<ERec>]) {
             return;
         }
         let Some(ingest) = parse_ts(f[3]) else { return };
-        let eid = key(f[0]);
+        let eid = eq_key(f[0]);
         let ing_rel = (ingest.div_euclid(1000) - c.ingest_base).clamp(0, u32::MAX as i64) as u32;
         let mut rec = ERec { eid, user: 0, ingest: ing_rel, ts: INVALID, pc: 0 };
         'v: {
