@@ -1217,6 +1217,98 @@ fn buckets<T>(n: usize, cap: usize) -> Vec<Vec<T>> {
     (0..n).map(|_| Vec::with_capacity(cap)).collect()
 }
 
+/// One 64-byte cache line of K records.
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct Line<T: Copy, const K: usize>([T; K]);
+
+/// Scatter into many buckets with software write-combining: records are staged per bucket in one
+/// cache-resident line and written out a full line at a time with non-temporal stores, so the
+/// destination lines are never read for ownership (RFO) and do not evict the working set.
+struct NtBuckets<T: Copy, const K: usize> {
+    stage: Vec<Line<T, K>>,
+    fill: Vec<u8>,
+    out: Vec<Vec<T>>,
+}
+impl<T: Copy, const K: usize> NtBuckets<T, K> {
+    fn new(n: usize, cap: usize) -> Self {
+        assert!(std::mem::size_of::<[T; K]>() == 64);
+        let out = (0..n)
+            .map(|_| {
+                // 64-byte aligned destination so every full line can be streamed
+                let c = (cap + K).max(K);
+                let layout = std::alloc::Layout::from_size_align(c * std::mem::size_of::<T>(), 64).unwrap();
+                let p = unsafe { std::alloc::alloc(layout) } as *mut T;
+                assert!(!p.is_null());
+                unsafe { Vec::from_raw_parts(p, 0, c) }
+            })
+            .collect();
+        let zero: [T; K] = unsafe { std::mem::zeroed() };
+        NtBuckets { stage: vec![Line(zero); n], fill: vec![0; n], out }
+    }
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.out.len()
+    }
+    #[inline(always)]
+    fn push(&mut self, b: usize, r: T) {
+        unsafe {
+            let f = self.fill.get_unchecked_mut(b);
+            let line = self.stage.get_unchecked_mut(b);
+            *line.0.get_unchecked_mut(*f as usize) = r;
+            *f += 1;
+            if *f as usize == K {
+                *f = 0;
+                let o = self.out.get_unchecked_mut(b);
+                if o.capacity() - o.len() < K {
+                    o.reserve(o.len().max(K));
+                }
+                let dst = o.as_mut_ptr().add(o.len());
+                stream_line(dst as *mut u8, line as *const Line<T, K> as *const u8);
+                o.set_len(o.len() + K);
+            }
+        }
+    }
+    /// Flushes staged records; returns plain per-bucket vectors (never freed: see pipeline).
+    fn finish(mut self) -> Vec<Vec<T>> {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_sfence();
+        }
+        for b in 0..self.out.len() {
+            for i in 0..self.fill[b] as usize {
+                self.out[b].push(self.stage[b].0[i]);
+            }
+        }
+        std::mem::take(&mut self.out)
+    }
+}
+
+#[inline(always)]
+fn nt_fence() {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_sfence();
+    }
+}
+
+/// Copies 64 bytes; non-temporal when `dst` is 64-byte aligned (x86 AVX2).
+#[inline(always)]
+unsafe fn stream_line(dst: *mut u8, src: *const u8) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        if (dst as usize) & 63 == 0 {
+            let a = _mm256_load_si256(src as *const __m256i);
+            let b = _mm256_load_si256(src.add(32) as *const __m256i);
+            _mm256_stream_si256(dst as *mut __m256i, a);
+            _mm256_stream_si256(dst.add(32) as *mut __m256i, b);
+            return;
+        }
+    }
+    unsafe { std::ptr::copy_nonoverlapping(src, dst, 64) };
+}
+
 // ---------------------------------------------------------------- records
 
 const INVALID: u32 = u32::MAX;
@@ -1347,7 +1439,7 @@ struct EvCtx<'a> {
 }
 
 #[inline(never)]
-fn parse_events(data: &[u8], c: &EvCtx, out: &mut [Vec<ERec>], longs: &mut LongMap) {
+fn parse_events(data: &[u8], c: &EvCtx, out: &mut NtBuckets<ERec, 2>, longs: &mut LongMap) {
     let mask = out.len() - 1;
     let mut dc = DateCache::new();
     let dend = data.as_ptr() as usize + data.len();
@@ -1378,8 +1470,9 @@ fn parse_events(data: &[u8], c: &EvCtx, out: &mut [Vec<ERec>], longs: &mut LongM
             rec.user = key_at(f[1], dend, longs);
             rec.ts = (ts - c.ws) as u32;
         }
-        out[part_of(eid, mask)].push(rec);
+        out.push(part_of(eid, mask), rec);
     });
+    nt_fence(); // streamed lines must be visible to other threads
 }
 
 #[inline(always)]
@@ -1532,12 +1625,12 @@ fn dedup_insert(ev_parts: &[Vec<Vec<ERec>>], b: usize, table: &mut Vec<Slot>, de
 
 /// Emits surviving (winning, valid) events in record order, mapped to persons and scattered.
 #[inline(never)]
-fn dedup_emit(ev_parts: &[Vec<Vec<ERec>>], b: usize, dead: &[bool], pm: &PersonMap, out: &mut [Vec<SRec>]) {
+fn dedup_emit(ev_parts: &[Vec<Vec<ERec>>], b: usize, dead: &[bool], pm: &PersonMap, out: &mut NtBuckets<SRec, 4>) {
     let qm = out.len() - 1;
     const BATCH: usize = 32;
     let mut buf: [(u64, u32, u32); BATCH] = [(0, 0, 0); BATCH];
     let mut n = 0usize;
-    let flush = |buf: &[(u64, u32, u32)], out: &mut [Vec<SRec>]| {
+    let flush = |buf: &[(u64, u32, u32)], out: &mut NtBuckets<SRec, 4>| {
         let mut ks = [0u64; BATCH];
         for (k, b) in ks.iter_mut().zip(buf) {
             *k = b.0;
@@ -1545,7 +1638,7 @@ fn dedup_emit(ev_parts: &[Vec<Vec<ERec>>], b: usize, dead: &[bool], pm: &PersonM
         let ks = &mut ks[..buf.len()];
         pm.resolve(ks);
         for (&person, &(_, ts, pc)) in ks.iter().zip(buf) {
-            unsafe { out.get_unchecked_mut(part_of(person, qm)) }.push(SRec { person, ts, pc });
+            out.push(part_of(person, qm), SRec { person, ts, pc });
         }
     };
     let mut g = 0usize;
@@ -1566,6 +1659,7 @@ fn dedup_emit(ev_parts: &[Vec<Vec<ERec>>], b: usize, dead: &[bool], pm: &PersonM
         }
     }
     flush(&buf[..n], out);
+    nt_fence();
 }
 
 #[inline(never)]
@@ -1865,10 +1959,10 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
                 bt,
                 n,
                 || {
-                    let bk: Vec<Vec<ERec>> = match variant {
-                        4 => vec![Vec::with_capacity(per)],
-                        5 => buckets::<ERec>(1024, per / 1024 * 5 / 4 + 16),
-                        _ => Vec::new(),
+                    let bk: NtBuckets<ERec, 2> = match variant {
+                        4 => NtBuckets::new(1, per),
+                        5 => NtBuckets::new(1024, per / 1024 * 5 / 4 + 16),
+                        _ => NtBuckets::new(1, 16),
                     };
                     (bk, 0u64, LongMap::default())
                 },
@@ -1896,7 +1990,7 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
             );
             let el = t.elapsed().as_secs_f64();
             std::hint::black_box(&states);
-            let recs: usize = states.iter().map(|s| s.0.iter().map(|v| v.len()).sum::<usize>()).sum();
+            let recs: usize = states.iter().map(|s| s.0.out.iter().map(|v| v.len()).sum::<usize>()).sum();
             std::hint::black_box(recs);
             drop(states);
             line.push_str(&format!(" v{}={:.1}", variant, el * 1e9 * bt as f64 / lines as f64));
@@ -1920,10 +2014,10 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
         });
         let cap = est_events / threads / P * 5 / 4 + 16;
         let ctx = EvCtx { ws, we, ingest_base, products: &products, unknown_cat };
-        let ev_states: Vec<(Vec<Vec<ERec>>, LongMap)> = parallel(
+        let ev_states: Vec<(NtBuckets<ERec, 2>, LongMap)> = parallel(
             threads,
             ev_chunks.len(),
-            || (buckets::<ERec>(P, cap), LongMap::default()),
+            || (NtBuckets::new(P, cap), LongMap::default()),
             |st, i| timed!(A_PARSE, parse_events(chunk_data(&ev_maps, &ev_chunks[i]), &ctx, &mut st.0, &mut st.1)),
         );
         log(&t0, "events parse threads done");
@@ -1932,13 +2026,14 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
     let mut long_maps: Vec<LongMap> = vec![link_longs];
     let mut ev_parts: Vec<Vec<Vec<ERec>>> = Vec::with_capacity(ev_states.len());
     for (parts, lm) in ev_states {
-        ev_parts.push(parts);
+        ev_parts.push(parts.finish());
         long_maps.push(lm);
     }
     log(&t0, &format!("events parsed ({} chunks); links: {} remapped ids", ev_chunks.len(), person_map.len()));
 
     // ---- dedup events + parse clicks, both into person buckets
     struct Mid {
+        evb: Option<NtBuckets<SRec, 4>>,
         ev: Vec<Vec<SRec>>,
         ck: Vec<Vec<CRec>>,
         table: Vec<Slot>,
@@ -1950,12 +2045,12 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
     let mids: Vec<Mid> = parallel(
         threads,
         P + ck_chunks.len(),
-        || Mid { ev: buckets(Q, ev_cap), ck: buckets(Q, ck_cap), table: Vec::new(), dead: Vec::new(), longs: LongMap::default() },
+        || Mid { evb: Some(NtBuckets::new(Q, ev_cap)), ev: Vec::new(), ck: buckets(Q, ck_cap), table: Vec::new(), dead: Vec::new(), longs: LongMap::default() },
         |st, task| {
             if task < P {
                 let b = task;
                 timed!(A_INS, dedup_insert(&ev_parts, b, &mut st.table, &mut st.dead));
-                timed!(A_EMIT, dedup_emit(&ev_parts, b, &st.dead, &person_map, &mut st.ev));
+                timed!(A_EMIT, dedup_emit(&ev_parts, b, &st.dead, &person_map, st.evb.as_mut().unwrap()));
             } else {
                 let c = &ck_chunks[task - P];
                 timed!(A_CLK, parse_clicks(chunk_data(&ck_maps, c), c.file, ck_maps[c.file].as_ref().unwrap().as_ptr(), cs, we, &campaigns, &person_map, &mut st.ck, &mut st.longs));
@@ -1966,6 +2061,7 @@ fn pipeline(cfg: &Cfg, data_dir: &Path, out_dir: &Path) {
     std::mem::forget(ev_parts);
     let mut mids = mids;
     for m in mids.iter_mut() {
+        m.ev = m.evb.take().unwrap().finish();
         long_maps.push(std::mem::take(&mut m.longs));
     }
     let longs = Longs(long_maps.iter().filter(|m| !m.is_empty()).collect());

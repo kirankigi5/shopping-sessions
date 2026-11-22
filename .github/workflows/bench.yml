@@ -4,7 +4,7 @@ on:
     branches: [bench]
   workflow_dispatch:
 env:
-  BASE: fast4
+  BASE: c289682d436ce644a60017cda29d93ef0e633386
 jobs:
   bench:
     runs-on: ubuntu-latest
@@ -23,7 +23,7 @@ jobs:
         run: |
           export RUSTFLAGS="-C target-cpu=x86-64-v3 -C force-frame-pointers=yes" CARGO_PROFILE_RELEASE_DEBUG=line-tables-only
           cargo build --release --locked -q && cp target/release/solution /tmp/new
-          git worktree add -q /tmp/base origin/$BASE && (cd /tmp/base && cargo build --release --locked -q --target-dir /tmp/tb) && cp /tmp/tb/release/solution /tmp/base.bin
+          git worktree add -q /tmp/base $BASE && (cd /tmp/base && cargo build --release --locked -q --target-dir /tmp/tb) && cp /tmp/tb/release/solution /tmp/base.bin
           (cd gen && cargo build --release -q)
       - name: generate 20M into tmpfs
         run: gen/target/release/generate --seed 7 --events 20000000 --clicks 5000000 --output /dev/shm/d >/dev/null
